@@ -793,7 +793,7 @@ def main() -> None:
     parser.add_argument("--hotpotqa", default="data/hotpotqa.jsonl")
     parser.add_argument("--limit_bipia", type=int, default=20)
     parser.add_argument("--limit_hotpotqa", type=int, default=20)
-    parser.add_argument("--max_output_tokens", type=int, default=32)
+    parser.add_argument("--max_output_tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="result/qwen3_shift_experiment/results.jsonl")
     parser.add_argument("--input", help="Input JSONL for --stage judge or --stage shapley.")
