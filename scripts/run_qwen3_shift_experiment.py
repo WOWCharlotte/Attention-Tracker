@@ -397,6 +397,133 @@ Model output:
             raise
 
 
+def build_result_row(dataset_name: str, sample: dict, output: str, attn: dict, judge_result=None) -> dict:
+    injection_status = judge_result["status"] if judge_result else "unjudged"
+
+    return {
+        "dataset": dataset_name,
+        "id": sample.get("id"),
+        "output": output,
+        "injection_status": injection_status,
+        "judge": judge_result,
+        "attention_shift": attn["at_detect"],
+        "attention": attn,
+        "shapley_coarse": None,
+        "shapley_fine": None,
+        "candidate_attention_shift_attack_failed": bool(attn["at_detect"] and injection_status == "failed"),
+        "sample": {
+            "system": sample.get("system"),
+            "user": sample.get("user"),
+            "data_fact": sample.get("data_fact"),
+            "data_attack": sample.get("data_attack"),
+            "clean_label": sample.get("clean_label"),
+            "answer": sample.get("answer"),
+            "attack_category": sample.get("attack_category"),
+            "position": sample.get("position"),
+        },
+    }
+
+
+def collect_dataset(model, detector, dataset_name: str, rows: List[dict], args) -> List[dict]:
+    results = []
+    for sample in tqdm(rows, desc=f"collect:{dataset_name}"):
+        auth, data = build_prompt(build_auth(sample), sample["data_fact"], sample.get("data_attack", ""))
+        output = infer_output(model, auth, data, args.max_output_tokens)
+        attn = attention_scores(model, detector, auth, data)
+        results.append(build_result_row(dataset_name, sample, output, attn))
+    return results
+
+
+def should_skip_judge(row: dict, args) -> dict | None:
+    data_attack = (row.get("sample", {}).get("data_attack") or "").strip()
+    if args.skip_judge_no_attack and (not data_attack or data_attack.lower() == "none."):
+        return {
+            "status": "failed",
+            "confidence": 1.0,
+            "reason": "No data_attack text is present; prompt injection cannot succeed.",
+            "evidence": "",
+            "provider": None,
+            "model": None,
+            "mode": "deterministic_no_attack",
+        }
+    if args.judge_only_attention_shift and not row.get("attention_shift", False):
+        return {
+            "status": "skipped",
+            "confidence": 0.0,
+            "reason": "Skipped because AttentionShift is false.",
+            "evidence": "",
+            "provider": None,
+            "model": None,
+            "mode": "skipped_attention_not_shifted",
+        }
+    return None
+
+
+def judge_rows(rows: List[dict], judge: InjectionJudge, args) -> List[dict]:
+    judged = []
+    for row in tqdm(rows, desc="judge"):
+        skip_result = should_skip_judge(row, args)
+        judge_result = skip_result if skip_result else judge.judge(row["sample"], row["output"])
+        row["judge"] = judge_result
+        row["injection_status"] = judge_result["status"]
+        row["candidate_attention_shift_attack_failed"] = bool(
+            row.get("attention_shift", False) and judge_result["status"] == "failed"
+        )
+        judged.append(row)
+    return judged
+
+
+def shapley_rows(model, rows: List[dict], args) -> List[dict]:
+    if args.shapley_scope == "candidates":
+        work_rows = [row for row in rows if row.get("candidate_attention_shift_attack_failed")]
+    elif args.shapley_scope == "attention_shift":
+        work_rows = [row for row in rows if row.get("attention_shift")]
+    else:
+        work_rows = rows
+
+    results = []
+    for row in tqdm(work_rows, desc="shapley"):
+        sample = row["sample"]
+        row["shapley_coarse"] = shapley(model, sample, row["output"], "coarse")
+        row["shapley_fine"] = shapley(model, sample, row["output"], "fine")
+        results.append(row)
+    return results
+
+
+def summarize(rows: List[dict]) -> dict:
+    summary = {
+        "total": len(rows),
+        "attention_shift": sum(1 for r in rows if r.get("attention_shift")),
+        "candidate_attention_shift_attack_failed": sum(
+            1 for r in rows if r.get("candidate_attention_shift_attack_failed")
+        ),
+        "by_dataset": {},
+    }
+    for dataset in sorted({r.get("dataset") for r in rows}):
+        dataset_rows = [r for r in rows if r.get("dataset") == dataset]
+        summary["by_dataset"][dataset] = {
+            "total": len(dataset_rows),
+            "attention_shift": sum(1 for r in dataset_rows if r.get("attention_shift")),
+            "candidate_attention_shift_attack_failed": sum(
+                1 for r in dataset_rows if r.get("candidate_attention_shift_attack_failed")
+            ),
+            "injection_status": {
+                s: sum(1 for r in dataset_rows if r.get("injection_status") == s)
+                for s in ["success", "failed", "ambiguous", "skipped", "unjudged"]
+            },
+        }
+    return summary
+
+
+def write_summary(output_path: str, rows: List[dict]) -> None:
+    summary = summarize(rows)
+    summary_path = os.path.splitext(output_path)[0] + ".summary.json"
+    os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
 def process_dataset(model, detector, judge: InjectionJudge, dataset_name: str, rows: List[dict], args) -> List[dict]:
     results = []
     for sample in tqdm(rows, desc=dataset_name):
@@ -404,32 +531,10 @@ def process_dataset(model, detector, judge: InjectionJudge, dataset_name: str, r
         output = infer_output(model, auth, data, args.max_output_tokens)
         attn = attention_scores(model, detector, auth, data)
         judge_result = judge.judge(sample, output)
-        injection_status = judge_result["status"]
-        coarse = shapley(model, sample, output, "coarse") if args.shapley else None
-        fine = shapley(model, sample, output, "fine") if args.shapley else None
-
-        row = {
-            "dataset": dataset_name,
-            "id": sample.get("id"),
-            "output": output,
-            "injection_status": injection_status,
-            "judge": judge_result,
-            "attention_shift": attn["at_detect"],
-            "attention": attn,
-            "shapley_coarse": coarse,
-            "shapley_fine": fine,
-            "candidate_attention_shift_attack_failed": bool(attn["at_detect"] and injection_status == "failed"),
-            "sample": {
-                "system": sample.get("system"),
-                "user": sample.get("user"),
-                "data_fact": sample.get("data_fact"),
-                "data_attack": sample.get("data_attack"),
-                "clean_label": sample.get("clean_label"),
-                "answer": sample.get("answer"),
-                "attack_category": sample.get("attack_category"),
-                "position": sample.get("position"),
-            },
-        }
+        row = build_result_row(dataset_name, sample, output, attn, judge_result)
+        if args.shapley:
+            row["shapley_coarse"] = shapley(model, sample, output, "coarse")
+            row["shapley_fine"] = shapley(model, sample, output, "fine")
         results.append(row)
     return results
 
@@ -446,7 +551,20 @@ def main() -> None:
     parser.add_argument("--max_output_tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="result/qwen3_shift_experiment/results.jsonl")
+    parser.add_argument("--input", help="Input JSONL for --stage judge or --stage shapley.")
+    parser.add_argument(
+        "--stage",
+        choices=["all", "collect", "judge", "shapley"],
+        default="all",
+        help="Decouple the pipeline into local collection, remote judging, and Shapley attribution.",
+    )
     parser.add_argument("--no_shapley", action="store_true")
+    parser.add_argument(
+        "--shapley_scope",
+        choices=["candidates", "attention_shift", "all"],
+        default="candidates",
+        help="Rows to compute Shapley for when --stage shapley is used.",
+    )
     parser.add_argument(
         "--judge_mode",
         choices=["llm", "heuristic", "none"],
@@ -458,40 +576,62 @@ def main() -> None:
         action="store_true",
         help="Use the old heuristic classifier if the LLM judge API call fails.",
     )
+    parser.add_argument(
+        "--judge_only_attention_shift",
+        action="store_true",
+        help="In --stage judge, call the judge only for rows with AttentionShift=True.",
+    )
+    parser.add_argument(
+        "--skip_judge_no_attack",
+        action="store_true",
+        help="In --stage judge, deterministically mark empty/None data_attack rows as failed without API calls.",
+    )
     args = parser.parse_args()
     args.shapley = not args.no_shapley
 
     set_seed(args.seed)
+    if args.stage == "collect":
+        config = open_config(f"./configs/model_configs/{args.model_name}_config.json")
+        model = create_model(config)
+        detector = AttentionDetector(model)
+        rows = []
+        rows.extend(collect_dataset(model, detector, "bipia", read_jsonl(args.bipia, args.limit_bipia), args))
+        rows.extend(collect_dataset(model, detector, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args))
+        write_jsonl(args.output, rows)
+        write_summary(args.output, rows)
+        return
+
+    if args.stage == "judge":
+        if not args.input:
+            raise ValueError("--stage judge requires --input from --stage collect.")
+        rows = read_jsonl(args.input)
+        judge = InjectionJudge(args)
+        rows = judge_rows(rows, judge, args)
+        write_jsonl(args.output, rows)
+        write_summary(args.output, rows)
+        return
+
+    if args.stage == "shapley":
+        if not args.input:
+            raise ValueError("--stage shapley requires --input from --stage judge.")
+        rows = read_jsonl(args.input)
+        config = open_config(f"./configs/model_configs/{args.model_name}_config.json")
+        model = create_model(config)
+        rows = shapley_rows(model, rows, args)
+        write_jsonl(args.output, rows)
+        write_summary(args.output, rows)
+        return
+
     judge = InjectionJudge(args)
     config = open_config(f"./configs/model_configs/{args.model_name}_config.json")
     model = create_model(config)
     detector = AttentionDetector(model)
 
-    all_results = []
-    all_results.extend(process_dataset(model, detector, judge, "bipia", read_jsonl(args.bipia, args.limit_bipia), args))
-    all_results.extend(process_dataset(model, detector, judge, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args))
-    write_jsonl(args.output, all_results)
-
-    summary = {
-        "total": len(all_results),
-        "attention_shift": sum(1 for r in all_results if r["attention_shift"]),
-        "candidate_attention_shift_attack_failed": sum(1 for r in all_results if r["candidate_attention_shift_attack_failed"]),
-        "by_dataset": {},
-    }
-    for dataset in sorted({r["dataset"] for r in all_results}):
-        rows = [r for r in all_results if r["dataset"] == dataset]
-        summary["by_dataset"][dataset] = {
-            "total": len(rows),
-            "attention_shift": sum(1 for r in rows if r["attention_shift"]),
-            "candidate_attention_shift_attack_failed": sum(1 for r in rows if r["candidate_attention_shift_attack_failed"]),
-            "injection_status": {s: sum(1 for r in rows if r["injection_status"] == s) for s in ["success", "failed", "ambiguous"]},
-        }
-
-    summary_path = os.path.splitext(args.output)[0] + ".summary.json"
-    os.makedirs(os.path.dirname(summary_path), exist_ok=True)
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    rows = []
+    rows.extend(process_dataset(model, detector, judge, "bipia", read_jsonl(args.bipia, args.limit_bipia), args))
+    rows.extend(process_dataset(model, detector, judge, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args))
+    write_jsonl(args.output, rows)
+    write_summary(args.output, rows)
 
 
 if __name__ == "__main__":
