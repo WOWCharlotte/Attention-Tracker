@@ -29,6 +29,17 @@ DATA_KEY = "data"
 FACT_KEY = "data_fact"
 ATTACK_KEY = "data_attack"
 JUDGE_STATUSES = {"success", "failed", "ambiguous"}
+ATTENTION_REGIONS = {"auth", "data", "data_fact", "data_attack"}
+ATTENTION_CONTROL_TOKENS = {
+    "system",
+    "user",
+    "data",
+    "data_fact",
+    "data_attack",
+    "im_start",
+    "im_end",
+}
+ATTENTION_CONTROL_FRAGMENTS = {"system", "user", "data", "fact", "attack"}
 
 
 def set_seed(seed: int) -> None:
@@ -95,19 +106,183 @@ def masked_parts(sample: dict, coalition: Tuple[str, ...], granularity: str) -> 
     return build_prompt(auth, data_fact, data_attack)
 
 
-def attention_scores(model, detector: AttentionDetector, auth: str, data: str) -> dict:
-    _, _, attention_maps, _, input_range, _ = model.inference(auth, data, max_output_tokens=1)
+def normalize_range(rng: Tuple[int, int], length: int) -> Tuple[int, int]:
+    start, end = rng
+    if start < 0:
+        start += length
+    if end < 0:
+        end += length
+    return max(0, start), min(length, end)
+
+
+def find_subsequence(items: List[str], needle: List[str], start: int = 0, end: int | None = None) -> Tuple[int, int] | None:
+    if not needle:
+        return None
+    end = len(items) if end is None else min(end, len(items))
+    last = end - len(needle)
+    for i in range(max(0, start), last + 1):
+        if items[i:i + len(needle)] == needle:
+            return i, i + len(needle)
+    return None
+
+
+def tokenized_piece(model, text: str) -> List[str]:
+    ids = model.tokenizer.encode(text, add_special_tokens=False)
+    return model.tokenizer.convert_ids_to_tokens(ids)
+
+
+def token_regions(model, tokens: List[str], input_range: Tuple[Tuple[int, int], Tuple[int, int]], sample: dict | None) -> dict:
+    auth_range = normalize_range(input_range[0], len(tokens))
+    data_range = normalize_range(input_range[1], len(tokens))
+    ranges = {
+        "auth": list(auth_range),
+        "data": list(data_range),
+    }
+    if sample:
+        fact_range = find_subsequence(
+            tokens,
+            tokenized_piece(model, sample.get("data_fact", "")),
+            start=data_range[0],
+            end=data_range[1],
+        )
+        attack_text = sample.get("data_attack", "")
+        attack_range = find_subsequence(
+            tokens,
+            tokenized_piece(model, attack_text),
+            start=data_range[0],
+            end=data_range[1],
+        ) if attack_text else None
+        if fact_range:
+            ranges["data_fact"] = list(fact_range)
+        if attack_range:
+            ranges["data_attack"] = list(attack_range)
+    return ranges
+
+
+def region_for_index(index: int, ranges: dict) -> str:
+    for name in ("data_attack", "data_fact", "auth", "data"):
+        if name in ranges:
+            start, end = ranges[name]
+            if start <= index < end:
+                return name
+    return "special"
+
+
+def clean_attention_token(token: str) -> str:
+    return (
+        token.replace("Ġ", " ")
+        .replace("▁", " ")
+        .replace("Ċ", "\n")
+        .replace("<|", "")
+        .replace("|>", "")
+        .strip()
+    )
+
+
+def is_meaningful_attention_token(token: str) -> bool:
+    cleaned = clean_attention_token(token)
+    if not cleaned:
+        return False
+    normalized = cleaned.strip("<>/[](){}:;,.!?\"'` \t\r\n").lower()
+    if not normalized or normalized in ATTENTION_CONTROL_TOKENS:
+        return False
+    if normalized.startswith("_") and normalized.strip("_-") in ATTENTION_CONTROL_FRAGMENTS:
+        return False
+    return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", normalized))
+
+
+def build_attention_record(
+    model,
+    dataset_name: str,
+    sample: dict,
+    output_tokens: List[str],
+    attention_map,
+    input_tokens: List[str],
+    input_range: Tuple[Tuple[int, int], Tuple[int, int]],
+    heads: List[List[int]],
+    args,
+) -> dict:
+    head_scores = [
+        attention_map[layer][0, head, -1, :].to(torch.float32)
+        for layer, head in heads
+    ]
+    token_scores = torch.stack(head_scores).mean(dim=0).tolist()
+    ranges = token_regions(model, input_tokens, input_range, sample)
+    tokens = []
+    region_scores = {}
+    for i, (token, score) in enumerate(zip(input_tokens, token_scores)):
+        score = float(score)
+        region = region_for_index(i, ranges)
+        if region not in ATTENTION_REGIONS:
+            continue
+        if not is_meaningful_attention_token(token):
+            continue
+        region_scores[region] = region_scores.get(region, 0.0) + score
+        tokens.append({
+            "i": i,
+            "t": token,
+            "s": score,
+            "r": region,
+        })
+
+    top_k = max(0, min(args.attention_top_k, len(tokens)))
+    top_tokens = sorted(tokens, key=lambda item: item["s"], reverse=True)[:top_k]
+    return {
+        "schema_version": 1,
+        "dataset": dataset_name,
+        "id": sample.get("id"),
+        "output_token_index": 0,
+        "generated_token": output_tokens[0] if output_tokens else "",
+        "num_input_tokens": len(input_tokens),
+        "token_ranges": ranges,
+        "region_scores": {k: float(v) for k, v in region_scores.items()},
+        "top_tokens": top_tokens,
+        "tokens": tokens,
+        "source": {
+            "model_name": args.model_name,
+            "attn_step": "first_generated_token",
+            "aggregation": "mean_over_important_heads",
+            "important_heads": heads,
+            "attention_index": "attention_maps[0][layer][0, head, -1, token_index]",
+        },
+    }
+
+
+def attention_scores(
+    model,
+    detector: AttentionDetector,
+    auth: str,
+    data: str,
+    sample: dict | None = None,
+    dataset_name: str | None = None,
+    args=None,
+) -> Tuple[dict, dict | None]:
+    _, output_tokens, attention_maps, input_tokens, input_range, _ = model.inference(auth, data, max_output_tokens=1)
     focus_score = detector.attn2score(attention_maps, input_range)
     attention_map = attention_maps[0]
     heatmap = process_attn(attention_map, input_range, detector.attn_func)
     heads = model.important_heads
-    return {
+    summary = {
         "focus_score": float(focus_score),
         "at_detect": bool(focus_score <= detector.threshold),
         "threshold": float(detector.threshold),
         "important_heads": heads,
         "mean_instruction_attention": float(torch.stack([heatmap[l, h] for l, h in heads]).mean().item()),
     }
+    attention_record = None
+    if args and args.save_attention_tokens:
+        attention_record = build_attention_record(
+            model,
+            dataset_name or "",
+            sample or {},
+            output_tokens,
+            attention_map,
+            input_tokens,
+            input_range,
+            heads,
+            args,
+        )
+    return summary, attention_record
 
 
 def infer_output(model, auth: str, data: str, max_output_tokens: int) -> str:
@@ -424,14 +599,17 @@ def build_result_row(dataset_name: str, sample: dict, output: str, attn: dict, j
     }
 
 
-def collect_dataset(model, detector, dataset_name: str, rows: List[dict], args) -> List[dict]:
+def collect_dataset(model, detector, dataset_name: str, rows: List[dict], args) -> Tuple[List[dict], List[dict]]:
     results = []
+    attention_records = []
     for sample in tqdm(rows, desc=f"collect:{dataset_name}"):
         auth, data = build_prompt(build_auth(sample), sample["data_fact"], sample.get("data_attack", ""))
         output = infer_output(model, auth, data, args.max_output_tokens)
-        attn = attention_scores(model, detector, auth, data)
+        attn, attention_record = attention_scores(model, detector, auth, data, sample, dataset_name, args)
         results.append(build_result_row(dataset_name, sample, output, attn))
-    return results
+        if attention_record:
+            attention_records.append(attention_record)
+    return results, attention_records
 
 
 def should_skip_judge(row: dict, args) -> dict | None:
@@ -524,19 +702,33 @@ def write_summary(output_path: str, rows: List[dict]) -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
-def process_dataset(model, detector, judge: InjectionJudge, dataset_name: str, rows: List[dict], args) -> List[dict]:
+def default_attention_output(output_path: str) -> str:
+    return os.path.splitext(output_path)[0] + ".attention.jsonl"
+
+
+def write_attention_records(args, attention_records: List[dict]) -> None:
+    if not args.save_attention_tokens:
+        return
+    path = args.attention_output or default_attention_output(args.output)
+    write_jsonl(path, attention_records)
+
+
+def process_dataset(model, detector, judge: InjectionJudge, dataset_name: str, rows: List[dict], args) -> Tuple[List[dict], List[dict]]:
     results = []
+    attention_records = []
     for sample in tqdm(rows, desc=dataset_name):
         auth, data = build_prompt(build_auth(sample), sample["data_fact"], sample.get("data_attack", ""))
         output = infer_output(model, auth, data, args.max_output_tokens)
-        attn = attention_scores(model, detector, auth, data)
+        attn, attention_record = attention_scores(model, detector, auth, data, sample, dataset_name, args)
         judge_result = judge.judge(sample, output)
         row = build_result_row(dataset_name, sample, output, attn, judge_result)
         if args.shapley:
             row["shapley_coarse"] = shapley(model, sample, output, "coarse")
             row["shapley_fine"] = shapley(model, sample, output, "fine")
         results.append(row)
-    return results
+        if attention_record:
+            attention_records.append(attention_record)
+    return results, attention_records
 
 
 def main() -> None:
@@ -586,6 +778,21 @@ def main() -> None:
         action="store_true",
         help="In --stage judge, deterministically mark empty/None data_attack rows as failed without API calls.",
     )
+    parser.add_argument(
+        "--save_attention_tokens",
+        action="store_true",
+        help="Write a separate JSONL with token-level attention for visualization during collect/all stages.",
+    )
+    parser.add_argument(
+        "--attention_output",
+        help="Output JSONL for --save_attention_tokens. Defaults to <output stem>.attention.jsonl.",
+    )
+    parser.add_argument(
+        "--attention_top_k",
+        type=int,
+        default=80,
+        help="Number of highest-attention tokens to duplicate in each attention record.",
+    )
     args = parser.parse_args()
     args.shapley = not args.no_shapley
 
@@ -595,9 +802,19 @@ def main() -> None:
         model = create_model(config)
         detector = AttentionDetector(model)
         rows = []
-        rows.extend(collect_dataset(model, detector, "bipia", read_jsonl(args.bipia, args.limit_bipia), args))
-        rows.extend(collect_dataset(model, detector, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args))
+        attention_records = []
+        dataset_rows, dataset_attention = collect_dataset(
+            model, detector, "bipia", read_jsonl(args.bipia, args.limit_bipia), args
+        )
+        rows.extend(dataset_rows)
+        attention_records.extend(dataset_attention)
+        dataset_rows, dataset_attention = collect_dataset(
+            model, detector, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args
+        )
+        rows.extend(dataset_rows)
+        attention_records.extend(dataset_attention)
         write_jsonl(args.output, rows)
+        write_attention_records(args, attention_records)
         write_summary(args.output, rows)
         return
 
@@ -628,9 +845,19 @@ def main() -> None:
     detector = AttentionDetector(model)
 
     rows = []
-    rows.extend(process_dataset(model, detector, judge, "bipia", read_jsonl(args.bipia, args.limit_bipia), args))
-    rows.extend(process_dataset(model, detector, judge, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args))
+    attention_records = []
+    dataset_rows, dataset_attention = process_dataset(
+        model, detector, judge, "bipia", read_jsonl(args.bipia, args.limit_bipia), args
+    )
+    rows.extend(dataset_rows)
+    attention_records.extend(dataset_attention)
+    dataset_rows, dataset_attention = process_dataset(
+        model, detector, judge, "hotpotqa", read_jsonl(args.hotpotqa, args.limit_hotpotqa), args
+    )
+    rows.extend(dataset_rows)
+    attention_records.extend(dataset_attention)
     write_jsonl(args.output, rows)
+    write_attention_records(args, attention_records)
     write_summary(args.output, rows)
 
 
