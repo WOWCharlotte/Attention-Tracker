@@ -235,6 +235,15 @@ def is_meaningful_attention_token(token: str) -> bool:
     return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", normalized))
 
 
+def add_region_score(region_scores: dict, region: str, score: float) -> None:
+    if region == "auth":
+        region_scores["auth"] = region_scores.get("auth", 0.0) + score
+    elif region in ("data", "data_fact", "data_attack"):
+        region_scores["data"] = region_scores.get("data", 0.0) + score
+        if region in ("data_fact", "data_attack"):
+            region_scores[region] = region_scores.get(region, 0.0) + score
+
+
 def build_attention_record(
     model,
     dataset_name: str,
@@ -261,7 +270,7 @@ def build_attention_record(
             continue
         if not is_meaningful_attention_token(token):
             continue
-        region_scores[region] = region_scores.get(region, 0.0) + score
+        add_region_score(region_scores, region, score)
         tokens.append({
             "i": i,
             "t": token,

@@ -137,10 +137,7 @@ python scripts/visualize_attention_tokens.py \
 | `result/qwen3_shift_experiment/full_e2e_20260702_101519.candidates_shapley.jsonl` | 候选 Shapley 结果 | 73 行，约 313K |
 | `result/qwen3_shift_experiment/full_e2e_20260702_101519.candidates_shapley.summary.json` | 候选 Shapley 汇总 | 384B |
 | `result/qwen3_shift_experiment/full_e2e_20260702_101519.candidates_shapley.log` | Shapley 日志 | 5.9K |
-| `result/qwen3_shift_experiment/full_e2e_20260702_101519.all_attention.html` | 全量 attention 可视化 | 340 个样本区块，约 12M |
-| `result/qwen3_shift_experiment/full_e2e_20260702_101519.attention.repaired.jsonl` | 修正区域标注后的 token-level attention | 340 行，约 6.9M |
-| `result/qwen3_shift_experiment/full_e2e_20260702_101519.all_attention.repaired.html` | 修正区域标注后的全量 attention 可视化 | 340 个样本区块，约 13M |
-| `result/qwen3_shift_experiment/full_e2e_20260702_101519.candidate96_attention.html` | 示例 attention 可视化 | 57K |
+| `result/qwen3_shift_experiment/full_e2e_20260702_101519.all_attention.repaired.html` | 全量 attention 可视化 | 340 个样本区块，约 13M |
 
 ## 5. 全量筛选结果
 
@@ -287,31 +284,14 @@ regions:
   data: 16
 ```
 
+
 全量 HTML：
-
-```text
-result/qwen3_shift_experiment/full_e2e_20260702_101519.all_attention.html
-```
-
-全量 HTML 校验：
-
-```text
-sample blocks: 340
-token spans: 66563
-file size: 12M
-```
-
-区域标注修正后重新生成了全量 HTML：
 
 ```text
 result/qwen3_shift_experiment/full_e2e_20260702_101519.all_attention.repaired.html
 ```
 
-修正原因：初版 attention 导出用“将 `data_attack` 文本单独 tokenize 后，在完整输入 token 序列中做精确子序列匹配”的方式寻找 attack token span。Qwen tokenizer 的 BPE token 边界会受上下文影响，`data_attack` 嵌入 `<data_attack>...</data_attack>` 标签后的 token 序列不一定等同于独立 tokenize 的 token 序列，因此 `data_attack` span 匹配失败。匹配失败后，这些 token 被归入粗粒度 `DATA` 区域，所以初版 HTML 中看不到 `ATTACK` 分数。
-
-修正版使用 `result.jsonl` 中保存的原始 sample 文本，基于 `build_data()` 的字符范围和 tokenizer offset mapping 重新标注 `FACT` / `ATTACK` token 区域，不需要重新跑模型。
-
-修正后校验：
+校验：
 
 ```text
 sample blocks: 340
@@ -322,13 +302,6 @@ records with attack region score: 180
 
 其中 180 条来自 BIPIA 的真实攻击样本；另外 60 条 BIPIA `clean_none` 变体和 100 条 HotPotQA 对照样本没有实际攻击文本，因此没有 `ATTACK` token 是预期行为。
 
-示例 HTML：
-
-```text
-result/qwen3_shift_experiment/full_e2e_20260702_101519.candidate96_attention.html
-```
-
-上述 HTML 均由 `full_e2e_20260702_101519.attention.jsonl` 离线生成，并通过 `--results` 合并主结果中的 `AttentionShift`、`injection_status`、`focus_score` 和模型输出。
 
 ## 8. 验证命令
 
@@ -375,3 +348,139 @@ python -m py_compile \
 4. 可视化脚本可直接从 attention JSONL 离线生成单样本 HTML 或全量合并 HTML；
 5. 候选 Shapley 补算完成，共 73 条候选；
 6. 结果继续支持此前判断：Attention shift 是风险信号，但不能直接等同于攻击成功。
+
+## 10. FQA
+
+### 10.1 AUTH/DATA/ATTACK/FACT 的分数和百分比是如何计算的？
+
+HTML 中每个 token 的 `s` 来自第一生成 token 对输入 token 的 attention：
+
+```text
+attention_maps[0][layer][0, head, -1, token_index]
+```
+
+可视化脚本先在 important heads 上对同一个 token 的 attention 取平均，得到 token-level score；然后按区域聚合。
+
+区域分数是区域内可计分 token 的 attention score 总和，不是平均数。当前修正后的口径为：
+
+```text
+AUTH   = <system>/<user> 授权任务区域内可计分 token 的 score 总和
+DATA   = <data> 父区域内所有可计分 token 的 score 总和
+FACT   = <data_fact> 子区域内可计分 token 的 score 总和
+ATTACK = <data_attack> 子区域内可计分 token 的 score 总和
+```
+
+百分比不是 token 数量占比，而是 attention 分数占比。当前 HTML 里 `AUTH` 和 `DATA` 使用有效父级总量作分母：
+
+```text
+effective_total = AUTH + DATA
+```
+
+因此：
+
+```text
+AUTH% = AUTH / (AUTH + DATA)
+DATA% = DATA / (AUTH + DATA)
+FACT% = FACT / (AUTH + DATA)
+ATTACK% = ATTACK / (AUTH + DATA)
+```
+
+其中 `FACT` 和 `ATTACK` 是 `DATA` 的子区域，因此它们的百分比是子区域相对父级有效总量的占比，不应再与 `DATA%` 相加理解为互斥分布。
+
+### 10.2 DATA 为什么不等于 FACT+ATTACK？
+
+因为当前修正后的 `DATA` 是 `<data></data>` 父区域总分，而 `FACT` 和 `ATTACK` 只是其中两个子区域：
+
+```text
+DATA   = <data> 父区域内所有可计分 token 的 score 总和
+FACT   = <data_fact> 子区域内可计分 token 的 score 总和
+ATTACK = <data_attack> 子区域内可计分 token 的 score 总和
+```
+
+因此通常不是：
+
+```text
+DATA = FACT + ATTACK
+```
+
+而是：
+
+```text
+DATA = DATA_OTHER + FACT + ATTACK
+```
+
+其中 `DATA_OTHER` 是 `<data>` 内没有落入 `<data_fact>` 或 `<data_attack>` 文本范围的剩余可计分 token。差值：
+
+```text
+DATA - FACT - ATTACK
+```
+
+就等于 `DATA_OTHER` 的 attention 总分。
+
+这些 token 可能来自 `<data>` 内的普通包装内容、分隔文本、子区域边界附近因 tokenizer offset 不完全贴合而未归入 `FACT/ATTACK` 的 token，或者旧 attention 文件中已经标为粗粒度 `data` 的 token。
+
+例如第 0 条 repaired 记录中：
+
+```text
+DATA        = 0.01859002881815286
+FACT        = 0.007706940216166913
+ATTACK      = 0.0031767955515533686
+DATA_OTHER  = DATA - FACT - ATTACK
+            = 0.007706293050432578
+```
+
+所以 `FACT + ATTACK` 小于 `DATA` 是预期现象，说明 `<data>` 父区域里除了事实文本和攻击文本之外，还有一部分剩余可计分 token。
+
+### 10.3 AUTH 为什么不等于 Focus Score？
+
+因为 `AUTH` 区域分数和 `Focus Score` 不是同一个指标。
+
+`AUTH` 是可视化用的 raw token attention 聚合：
+
+```text
+AUTH = sum(mean_over_important_heads(token_attention))
+```
+
+也就是先对每个 token 在 important heads 上取平均，再对 `AUTH` 区域内可显示、可计分 token 求和。
+
+`Focus Score` 是 Attention Tracker 检测用的归一化指标。代码中使用 `normalize_sum`，在每个 important head 上先计算：
+
+```text
+auth_attention_sum / (auth_attention_sum + data_attention_sum)
+```
+
+然后再对 important heads 取平均。
+
+两者差异主要有三点：
+
+1. `AUTH` 是 raw attention 总和；`Focus Score` 是 auth 相对 auth+data 的归一化比例。
+2. `AUTH` 是先 head 平均再 token 求和；`Focus Score` 是每个 head 先区域求和并归一化，再对 head 求平均。
+3. `AUTH` 使用可视化过滤后的 token；`Focus Score` 使用检测器的完整 `input_range`，不按 HTML 展示过滤规则计算。
+
+因此 `AUTH` 和 `Focus Score` 数值不应期望相等。
+
+### 10.4 AUTH+DATA 分数为什么不等于 1？
+
+因为 HTML 中的 `AUTH` 和 `DATA` 分数本身不是归一化概率，而是 raw token attention score 的区域总和。
+
+虽然单个 attention head 对所有可 attend token 的 attention 总和通常接近 1，但当前 HTML 分数经过了以下处理：
+
+1. 只保留 `AUTH/DATA/FACT/ATTACK` 等展示区域；
+2. 过滤了 special token 和无意义控制 token；
+3. token score 是 important heads 上的平均值；
+4. `AUTH` 和 `DATA` 是区域内 token score 的总和，不是重新归一化后的概率。
+
+所以：
+
+```text
+AUTH + DATA
+```
+
+表示展示口径下两个父级区域的 raw attention 总量，不保证等于 1。
+
+如果需要归一化解读，应看百分比：
+
+```text
+AUTH% = AUTH / (AUTH + DATA)
+DATA% = DATA / (AUTH + DATA)
+```

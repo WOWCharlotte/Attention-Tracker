@@ -72,6 +72,25 @@ def is_meaningful_attention_token(token: str) -> bool:
     return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", normalized))
 
 
+def add_region_score(region_scores: dict, region: str, score: float) -> None:
+    if region == "auth":
+        region_scores["auth"] = region_scores.get("auth", 0.0) + score
+    elif region in ("data", "data_fact", "data_attack"):
+        region_scores["data"] = region_scores.get("data", 0.0) + score
+        if region in ("data_fact", "data_attack"):
+            region_scores[region] = region_scores.get(region, 0.0) + score
+
+
+def region_score_total(region_scores: dict) -> float:
+    if "data" in region_scores:
+        total = float(region_scores.get("auth", 0.0)) + float(region_scores.get("data", 0.0))
+        for region, score in region_scores.items():
+            if region not in ("auth", "data", "data_fact", "data_attack"):
+                total += float(score)
+        return total or 1.0
+    return sum(float(v) for v in region_scores.values()) or 1.0
+
+
 def read_jsonl(path: str) -> list[dict]:
     rows = []
     with open(path, "r", encoding="utf-8") as f:
@@ -176,8 +195,10 @@ def relabel_record_regions(record: dict, result: dict | None, tokenizer) -> dict
         if region not in FILTER_REGIONS:
             continue
         token["r"] = region
+        if not is_meaningful_attention_token(str(token.get("t", ""))):
+            continue
         score = float(token.get("s", 0.0))
-        region_scores[region] = region_scores.get(region, 0.0) + score
+        add_region_score(region_scores, region, score)
         tokens.append(token)
     top_k = max(0, min(len(record.get("top_tokens", [])) or 80, len(tokens)))
     record["token_ranges"] = ranges
@@ -210,15 +231,17 @@ def merge_result_metadata(record: dict, result_rows: list[dict] | None, tokenize
 
 def drop_special_attention(record: dict) -> dict:
     record = dict(record)
-    tokens = [
-        token
-        for token in record.get("tokens", [])
-        if token.get("r") in FILTER_REGIONS and is_meaningful_attention_token(str(token.get("t", "")))
-    ]
+    tokens = []
     region_scores = {}
-    for token in tokens:
-        region = token.get("r")
-        region_scores[region] = region_scores.get(region, 0.0) + float(token.get("s", 0.0))
+    for token in record.get("tokens", []):
+        token = dict(token)
+        region = str(token.get("r", "special"))
+        if region not in FILTER_REGIONS:
+            continue
+        if not is_meaningful_attention_token(str(token.get("t", ""))):
+            continue
+        add_region_score(region_scores, region, float(token.get("s", 0.0)))
+        tokens.append(token)
     top_k = max(0, min(len(record.get("top_tokens", [])) or 80, len(tokens)))
     top_tokens = sorted(tokens, key=lambda token: float(token.get("s", 0.0)), reverse=True)[:top_k]
     record["tokens"] = tokens
@@ -369,7 +392,7 @@ def render_legend() -> str:
 
 
 def render_region_scores(region_scores: dict) -> str:
-    total = sum(float(v) for v in region_scores.values()) or 1.0
+    total = region_score_total(region_scores)
     items = []
     for region, score in sorted(region_scores.items(), key=lambda item: float(item[1]), reverse=True):
         score = float(score)
@@ -384,7 +407,7 @@ def render_region_scores(region_scores: dict) -> str:
                 <span>{score:.6f}</span>
               </div>
               <div class="bar"><span style="width:{pct:.2f}%"></span></div>
-              <div class="metric-foot">{pct:.2f}% of recorded token attention</div>
+              <div class="metric-foot">{pct:.2f}% of scored token attention</div>
             </div>
             """
         )
@@ -455,7 +478,11 @@ def merge_all_result_metadata(records: list[dict], result_rows: list[dict] | Non
 
 def render_all_filters(records: list[dict]) -> str:
     max_score = max(
-        (float(token.get("s", 0.0)) for record in records for token in record.get("tokens", [])),
+        (
+            float(token.get("s", 0.0))
+            for record in records
+            for token in record.get("tokens", [])
+        ),
         default=0.0,
     )
     controls = []
@@ -537,7 +564,7 @@ def render_record_header(record: dict, index: int) -> str:
 def render_compact_region_scores(region_scores: dict) -> str:
     if not region_scores:
         return ""
-    total = sum(float(v) for v in region_scores.values()) or 1.0
+    total = region_score_total(region_scores)
     items = []
     for region, score in sorted(region_scores.items(), key=lambda item: float(item[1]), reverse=True):
         score = float(score)
