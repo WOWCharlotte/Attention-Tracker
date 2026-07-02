@@ -131,6 +131,39 @@ def tokenized_piece(model, text: str) -> List[str]:
     return model.tokenizer.convert_ids_to_tokens(ids)
 
 
+def token_span_from_offsets(model, text: str, char_start: int, char_end: int) -> Tuple[int, int] | None:
+    if char_start < 0 or char_end <= char_start:
+        return None
+    try:
+        encoded = model.tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except NotImplementedError:
+        return None
+    offsets = encoded.get("offset_mapping")
+    if not offsets:
+        return None
+    indices = [
+        i
+        for i, (start, end) in enumerate(offsets)
+        if end > char_start and start < char_end
+    ]
+    if not indices:
+        return None
+    return indices[0], indices[-1] + 1
+
+
+def text_range(text: str, needle: str, start: int = 0) -> Tuple[int, int] | None:
+    if not needle:
+        return None
+    pos = text.find(needle, start)
+    if pos < 0:
+        return None
+    return pos, pos + len(needle)
+
+
 def token_regions(model, tokens: List[str], input_range: Tuple[Tuple[int, int], Tuple[int, int]], sample: dict | None) -> dict:
     auth_range = normalize_range(input_range[0], len(tokens))
     data_range = normalize_range(input_range[1], len(tokens))
@@ -139,6 +172,7 @@ def token_regions(model, tokens: List[str], input_range: Tuple[Tuple[int, int], 
         "data": list(data_range),
     }
     if sample:
+        data_text = build_data(sample.get("data_fact", ""), sample.get("data_attack", ""))
         fact_range = find_subsequence(
             tokens,
             tokenized_piece(model, sample.get("data_fact", "")),
@@ -152,6 +186,16 @@ def token_regions(model, tokens: List[str], input_range: Tuple[Tuple[int, int], 
             start=data_range[0],
             end=data_range[1],
         ) if attack_text else None
+        fact_text_range = text_range(data_text, sample.get("data_fact", ""))
+        attack_text_range = text_range(data_text, attack_text) if attack_text else None
+        if fact_text_range:
+            offset_range = token_span_from_offsets(model, data_text, *fact_text_range)
+            if offset_range:
+                fact_range = (data_range[0] + offset_range[0], data_range[0] + offset_range[1])
+        if attack_text_range:
+            offset_range = token_span_from_offsets(model, data_text, *attack_text_range)
+            if offset_range:
+                attack_range = (data_range[0] + offset_range[0], data_range[0] + offset_range[1])
         if fact_range:
             ranges["data_fact"] = list(fact_range)
         if attack_range:
