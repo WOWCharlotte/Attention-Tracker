@@ -29,6 +29,23 @@ class VisualizeAttentionTokensTest(unittest.TestCase):
         self.assertEqual(filtered["region_scores"]["data_attack"], 2.0)
         self.assertEqual(len(filtered["tokens"]), 3)
 
+    def test_special_tokens_are_visible_scored_and_filterable(self):
+        record = {
+            "tokens": [
+                {"i": 0, "t": "<|im_start|>", "s": 4.0, "r": "special"},
+                {"i": 1, "t": "auth", "s": 1.0, "r": "auth"},
+            ],
+            "top_tokens": [],
+            "num_input_tokens": 2,
+        }
+
+        filtered = viz.drop_special_attention(record)
+        filters_html = viz.render_filters(filtered["tokens"])
+
+        self.assertEqual(filtered["region_scores"]["special"], 4.0)
+        self.assertEqual(len(filtered["tokens"]), 2)
+        self.assertIn('value="special"', filters_html)
+
 
 if __name__ == "__main__":
     unittest.main()

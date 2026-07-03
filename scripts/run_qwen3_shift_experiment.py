@@ -29,7 +29,7 @@ DATA_KEY = "data"
 FACT_KEY = "data_fact"
 ATTACK_KEY = "data_attack"
 JUDGE_STATUSES = {"success", "failed", "ambiguous"}
-ATTENTION_REGIONS = {"auth", "data", "data_fact", "data_attack"}
+ATTENTION_REGIONS = {"auth", "data", "data_fact", "data_attack", "special"}
 ATTENTION_CONTROL_TOKENS = {
     "system",
     "user",
@@ -242,6 +242,8 @@ def add_region_score(region_scores: dict, region: str, score: float) -> None:
         region_scores["data"] = region_scores.get("data", 0.0) + score
         if region in ("data_fact", "data_attack"):
             region_scores[region] = region_scores.get(region, 0.0) + score
+    elif region == "special":
+        region_scores["special"] = region_scores.get("special", 0.0) + score
 
 
 def build_attention_record(
@@ -268,7 +270,7 @@ def build_attention_record(
         region = region_for_index(i, ranges)
         if region not in ATTENTION_REGIONS:
             continue
-        if not is_meaningful_attention_token(token):
+        if region != "special" and not is_meaningful_attention_token(token):
             continue
         add_region_score(region_scores, region, score)
         tokens.append({

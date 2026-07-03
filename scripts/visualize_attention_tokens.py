@@ -23,7 +23,7 @@ REGION_CLASSES = {
     "special": "region-special",
 }
 
-FILTER_REGIONS = ("auth", "data", "data_fact", "data_attack")
+FILTER_REGIONS = ("auth", "data", "data_fact", "data_attack", "special")
 CONTROL_TOKENS = {
     "system",
     "user",
@@ -79,13 +79,15 @@ def add_region_score(region_scores: dict, region: str, score: float) -> None:
         region_scores["data"] = region_scores.get("data", 0.0) + score
         if region in ("data_fact", "data_attack"):
             region_scores[region] = region_scores.get(region, 0.0) + score
+    elif region == "special":
+        region_scores["special"] = region_scores.get("special", 0.0) + score
 
 
 def region_score_total(region_scores: dict) -> float:
     if "data" in region_scores:
-        total = float(region_scores.get("auth", 0.0)) + float(region_scores.get("data", 0.0))
+        total = 0.0
         for region, score in region_scores.items():
-            if region not in ("auth", "data", "data_fact", "data_attack"):
+            if region not in ("data_fact", "data_attack"):
                 total += float(score)
         return total or 1.0
     return sum(float(v) for v in region_scores.values()) or 1.0
@@ -195,7 +197,7 @@ def relabel_record_regions(record: dict, result: dict | None, tokenizer) -> dict
         if region not in FILTER_REGIONS:
             continue
         token["r"] = region
-        if not is_meaningful_attention_token(str(token.get("t", ""))):
+        if region != "special" and not is_meaningful_attention_token(str(token.get("t", ""))):
             continue
         score = float(token.get("s", 0.0))
         add_region_score(region_scores, region, score)
@@ -238,7 +240,7 @@ def drop_special_attention(record: dict) -> dict:
         region = str(token.get("r", "special"))
         if region not in FILTER_REGIONS:
             continue
-        if not is_meaningful_attention_token(str(token.get("t", ""))):
+        if region != "special" and not is_meaningful_attention_token(str(token.get("t", ""))):
             continue
         add_region_score(region_scores, region, float(token.get("s", 0.0)))
         tokens.append(token)
@@ -372,7 +374,7 @@ def render_filters(tokens: list[dict]) -> str:
           </div>
         </div>
         <div class="filter-actions">
-          <button type="button" id="select-main-regions">AUTH/DATA/FACT/ATTACK</button>
+          <button type="button" id="select-main-regions">All regions</button>
           <button type="button" id="clear-regions">Clear regions</button>
           <button type="button" id="reset-filters">Reset</button>
           <span id="visible-count"></span>
@@ -509,7 +511,7 @@ def render_all_filters(records: list[dict]) -> str:
           </div>
         </div>
         <div class="filter-actions">
-          <button type="button" id="select-main-regions">AUTH/DATA/FACT/ATTACK</button>
+          <button type="button" id="select-main-regions">All regions</button>
           <button type="button" id="clear-regions">Clear regions</button>
           <button type="button" id="reset-filters">Reset</button>
           <span id="visible-count"></span>
