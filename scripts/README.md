@@ -207,9 +207,92 @@ python scripts/run_qwen3_shift_experiment.py --stage shapley \
 
 ---
 
-## 9. 常见问题
+## 9. 注意力可视化：`visualize_attention_tokens.py`
+
+`run_qwen3_shift_experiment.py --save_attention_tokens` 产出的 `results.attention.jsonl` 是一行一条 token 级注意力记录，本身不便直接阅读。`scripts/visualize_attention_tokens.py` 负责把它（可选地与主结果 `results.jsonl` 联动）渲染成**自包含、零依赖**的 HTML 热力图。
+
+### 9.1 两种渲染模式
+
+| 模式 | 触发参数 | 输出 | 典型用途 |
+| --- | --- | --- | --- |
+| 单样本 | 默认（`--index` / `--id`） | 一份 HTML，左侧是 token-wall，右侧是 Region Scores / Token Ranges / Top Tokens / Source 信息卡 | 仔细查看某条反例样本 |
+| 全量 | `--all` | 一份 HTML，所有样本以 `<details>` 折叠列表呈现，顶部带 6 张 summary 卡片（Total / Display Tokens / Attention Shift / Attack Success / Attack Failed / Shift+Failed） | 横向对比所有 `AttentionShift ∧ InjectionStatus=failed` 候选 |
+
+> `--all` 模式下默认会**自动展开** `AttentionShift=True` 的样本，便于优先 review。
+
+### 9.2 可视化语义
+
+- **填充透明度**（`--attn-alpha`，范围 `0.08 ~ 0.90`）表示 token 注意力分数；所有区域共用一条由 `score_scale()` 计算的 0~98% 分位数 scale，颜色越深分数越高。
+- **下划线颜色**表示 token 所属区域：`auth=蓝 / data=灰 / fact=绿 / attack=红 / special=金`。
+- **交互**：页面顶部提供 5 个 region 复选框（`AUTH / DATA / FACT / ATTACK / SPECIAL`）和 `Minimum score` 输入框 / 滑块，可按区域与分数阈值动态过滤 token。
+
+### 9.3 命令行参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--input` | _必填_ | `run_qwen3_shift_experiment.py --save_attention_tokens` 产出的 attention JSONL |
+| `--output` | _必填_ | 输出的 HTML 文件路径（自动创建父目录） |
+| `--id` | _None_ | 按 `record["id"]` 选择单条记录；与 `--index` 互斥 |
+| `--index` | `0` | 在 JSONL 中的 0-based 行号；与 `--id` 互斥 |
+| `--all` | _off_ | 全量渲染所有记录为同一份 HTML（折叠列表） |
+| `--results` | _None_ | 主结果 JSONL（`results.jsonl`），用于把 `AttentionShift` / `injection_status` / `focus_score` / `output` 标注到 HTML 头部 |
+| `--repair_regions_from_results` | _off_ | 用 `--results` 中 `sample.data_fact / data_attack` 文本 + tokenizer offset，重新定位 FACT/ATTACK 的 token 区间，再重打 region 标签 |
+| `--tokenizer_model_id` | `/root/Qwen3-8B` | 配合 `--repair_regions_from_results` 使用的分词器路径 / HF model id |
+| `--write_repaired_attention` | _None_ | 把修复后的 attention 记录落盘为 JSONL，便于复用 |
+
+### 9.4 快速开始
+
+```bash
+# 1) 全量渲染（推荐先跑这条）
+python scripts/visualize_attention_tokens.py \
+    --input  result/qwen3_shift_experiment/results.attention.jsonl \
+    --results result/qwen3_shift_experiment/results.jsonl \
+    --all \
+    --output result/qwen3_shift_experiment/visualize_all.html
+
+# 2) 单独看某条样本
+python scripts/visualize_attention_tokens.py \
+    --input  result/qwen3_shift_experiment/results.attention.jsonl \
+    --results result/qwen3_shift_experiment/results.jsonl \
+    --id "email_000_end_Task Automation-0" \
+    --output result/qwen3_shift_experiment/visualize_one.html
+
+# 3) 修复 FACT/ATTACK 区域 + 同时落盘修复后的 JSONL
+python scripts/visualize_attention_tokens.py \
+    --input  result/qwen3_shift_experiment/results.attention.jsonl \
+    --results result/qwen3_shift_experiment/results.jsonl \
+    --repair_regions_from_results \
+    --tokenizer_model_id /root/Qwen3-8B \
+    --write_repaired_attention result/qwen3_shift_experiment/results.attention.repaired.jsonl \
+    --all \
+    --output result/qwen3_shift_experiment/visualize_all_repaired.html
+```
+
+### 9.5 关键模块速查
+
+| 函数 | 作用 |
+| --- | --- |
+| `read_jsonl / write_jsonl` | 注意力 JSONL 读写；`write_jsonl` 会自动 `mkdir -p` 父目录 |
+| `select_record` | 按 `--id` 或 `--index` 选样本；找不到时抛 `ValueError / IndexError` |
+| `repaired_ranges` | 用样本原文 + tokenizer `offset_mapping` 重新算 FACT/ATTACK 的 token 区间 |
+| `region_for_index / relabel_record_regions` | 重新打 `data_attack / data_fact / auth / data / special` 区域标签 |
+| `merge_result_metadata / merge_all_result_metadata` | 把 `--results` 中的 `attention_shift / injection_status / focus_score / output / judge` 合并到注意力记录 |
+| `drop_special_attention` | 过滤掉空白 / 控制 token（`system / user / data / im_start / im_end` 等），并重新计算 `region_scores` / `top_tokens` |
+| `score_scale / attention_alpha` | 0~98% 分位数 → 0.08~0.90 的 alpha 填充 |
+| `render_tokens / render_html / render_all_html` | 自包含 HTML 渲染（CSS + JS 都在脚本内，浏览器直开即可） |
+
+### 9.6 常见问题
+
+- **FACT / ATTACK 区间错位**：`run_qwen3_shift_experiment.py` 输出的 `token_ranges` 是基于首轮 token 序列的近似匹配；遇到 token 化差异时请加 `--repair_regions_from_results` 并指定与推理时一致的 `--tokenizer_model_id`。
+- **HTML 打开后 region 全是灰色**：先确认 JSONL 中 `token_ranges` 是否含 `data_fact / data_attack`；否则先跑 `--repair_regions_from_results`。
+- **分词器加载失败**：`--tokenizer_model_id` 需要与 `qwen3_8b-attn_config.json` 中的 `model_id` 保持一致，或改成本地已下载的 HF 模型 id。
+- **超大 JSONL 渲染卡顿**：拆分 JSONL 后分批可视化，或用 `--index / --id` 单独看关键样本。
+
+---
+
+## 10. 常见问题
 
 - **`JUDGE_API_KEY is empty`**：在仓库根目录 `.env` 填入有效 Key，或显式传 `--judge_mode heuristic` 跑离线模式。
 - **Shapley 极慢**：每次 Shapley 需要 `2^N` 次前向传播（`coarse` 4 次、`fine` 8 次）。可通过 `--shapley_scope candidates` 把范围限定在反例上，必要时配合 `--limit_bipia / --limit_hotpotqa` 进一步缩小。
 - **`important_heads` 缺失或不一致**：重新跑 `scripts/find_heads.sh` 或参考 `select_head.py` 重新挑选 Qwen3-8B 的重要 head。
-- **可视化**：把 `results.attention.jsonl` 喂给 `scripts/visualize_attention_tokens.py` 即可得到按 `auth / data_fact / data_attack / special` 区域上色的注意力可视化。
+- **注意力区间错位 / 可视化异常**：参考第 9.6 节，用 `--repair_regions_from_results` 修复 FACT/ATTACK 区域。
