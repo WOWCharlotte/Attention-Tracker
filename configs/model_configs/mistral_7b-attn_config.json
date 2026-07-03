@@ -2,7 +2,7 @@
     "model_info": {
         "provider": "attn-hf",
         "name": "mistral-7b-0.3",
-        "model_id": "mistralai/Mistral-7B-Instruct-v0.3"
+        "model_id": "/root/autodl-tmp/hf_models/mistralai--Mistral-7B-Instruct-v0.3"
     },
     "params": {
         "temperature": 0.1,

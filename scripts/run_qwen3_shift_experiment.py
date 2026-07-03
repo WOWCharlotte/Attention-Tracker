@@ -357,10 +357,15 @@ def infer_output(model, auth: str, data: str, max_output_tokens: int) -> str:
 
 
 def chat_text(model, auth: str, data: str, add_generation_prompt: bool = True) -> str:
-    messages = [
-        {"role": "system", "content": auth},
-        {"role": "user", "content": "Data: " + data},
-    ]
+    if getattr(model, "provider", "") == "attn-hf-no-sys":
+        messages = [
+            {"role": "user", "content": auth + "\nData: " + data},
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": auth},
+            {"role": "user", "content": "Data: " + data},
+        ]
     return model.tokenizer.apply_chat_template(
         messages,
         tokenize=False,
