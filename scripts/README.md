@@ -196,10 +196,9 @@ python scripts/run_qwen3_shift_experiment.py --stage shapley \
 | 函数 | 作用 |
 | --- | --- |
 | `build_auth / build_data / build_prompt` | 把样本渲染成 `<system>…<user>` + `<data>…` 的两段式 prompt |
-| `masked_parts` | Shapley 中按联盟把被屏蔽字段替换为 `[REMOVED_*]` 占位符 |
 | `token_regions / region_for_index` | 依据 token 序列和 `<data_fact>/<data_attack>` 文本定位，划定每个 token 所属的 `auth / data / data_fact / data_attack / special` 区域 |
 | `attention_scores` | 调一次 `model.inference` 抓首 token 的 attention map，产出 `focus_score / at_detect / threshold / mean_instruction_attention` 以及可选的 token 级 attention 记录 |
-| `shapley` | 在玩家集合（`coarse: {auth, data}` 或 `fine: {auth, data_fact, data_attack}`）上枚举所有联盟并做对数似然差分，输出 Shapley 值与所有联盟值 |
+| `shapley`（`scripts/shapley_attribution.py`） | 在玩家集合（`coarse: {auth, data}` 或 `fine: {auth, data_fact, data_attack}`）上枚举所有联盟，通过 **embedding 干预**（被掩码区域 token embedding 置零）而非字符串替换计算 `v(S)`，输出 Shapley 值与所有联盟值；统一在 chat-template 化后的 prompt 上打分，保证与推理时一致 |
 | `InjectionJudge` | 默认通过 OpenAI 兼容 API 调 LLM 做注入成功判定，支持启发式回退 |
 | `classify_injection` | 离线启发式：基于词重叠、攻击关键词、`base64`、脚本指令等做粗略分类 |
 | `should_skip_judge` | 短路 `data_attack` 为空或 `AttentionShift=False` 的样本，节省 API 配额 |
