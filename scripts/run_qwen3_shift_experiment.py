@@ -1,12 +1,10 @@
 import argparse
-import itertools
 import json
-import math
 import os
 import random
 import re
 import sys
-from typing import Dict, Iterable, List, Tuple
+from typing import Iterable, List, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -14,7 +12,6 @@ if REPO_ROOT not in sys.path:
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
@@ -22,6 +19,7 @@ from tqdm import tqdm
 from detector.attn import AttentionDetector
 from detector.utils import process_attn
 from utils import create_model, open_config
+from shapley_attribution import shapley as _shapley_impl
 
 
 AUTH_KEY = "auth"
@@ -88,22 +86,6 @@ def build_data(data_fact: str, data_attack: str) -> str:
 
 def build_prompt(auth: str, data_fact: str, data_attack: str) -> Tuple[str, str]:
     return auth, build_data(data_fact, data_attack)
-
-
-def masked_parts(sample: dict, coalition: Tuple[str, ...], granularity: str) -> Tuple[str, str]:
-    auth = build_auth(sample) if AUTH_KEY in coalition else (
-        "<system>\n[REMOVED_SYSTEM_RULES]\n</system>\n\n"
-        "<user>\n[REMOVED_USER_TASK]\n</user>"
-    )
-
-    if granularity == "coarse":
-        data_fact = sample["data_fact"] if DATA_KEY in coalition else "[REMOVED_DATA_FACT]"
-        data_attack = sample.get("data_attack", "") if DATA_KEY in coalition else "[REMOVED_UNTRUSTED_CONTROL_TEXT]"
-    else:
-        data_fact = sample["data_fact"] if FACT_KEY in coalition else "[REMOVED_DATA_FACT]"
-        data_attack = sample.get("data_attack", "") if ATTACK_KEY in coalition else "[REMOVED_UNTRUSTED_CONTROL_TEXT]"
-
-    return build_prompt(auth, data_fact, data_attack)
 
 
 def normalize_range(rng: Tuple[int, int], length: int) -> Tuple[int, int]:
@@ -374,53 +356,20 @@ def chat_text(model, auth: str, data: str, add_generation_prompt: bool = True) -
     )
 
 
-def output_logprob(model, auth: str, data: str, output_text: str) -> float:
-    tokenizer = model.tokenizer
-    prompt = chat_text(model, auth, data, add_generation_prompt=True)
-    prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(model.model.device)
-    output_ids = tokenizer(output_text, return_tensors="pt", add_special_tokens=False).input_ids.to(model.model.device)
-    if output_ids.shape[1] == 0:
-        return float("-inf")
-
-    input_ids = torch.cat([prompt_ids, output_ids], dim=1)
-    attention_mask = torch.ones_like(input_ids, device=model.model.device)
-    with torch.no_grad():
-        logits = model.model(input_ids=input_ids, attention_mask=attention_mask).logits
-
-    start = prompt_ids.shape[1] - 1
-    end = start + output_ids.shape[1]
-    token_logits = logits[:, start:end, :]
-    log_probs = F.log_softmax(token_logits.float(), dim=-1)
-    gathered = log_probs.gather(2, output_ids.unsqueeze(-1)).squeeze(-1)
-    return float(gathered.sum().item())
-
-
 def shapley(model, sample: dict, output_text: str, granularity: str) -> dict:
-    players = [AUTH_KEY, DATA_KEY] if granularity == "coarse" else [AUTH_KEY, FACT_KEY, ATTACK_KEY]
-    values: Dict[Tuple[str, ...], float] = {}
-    for r in range(len(players) + 1):
-        for coalition in itertools.combinations(players, r):
-            auth, data = masked_parts(sample, coalition, granularity)
-            values[coalition] = output_logprob(model, auth, data, output_text)
+    """Compute Shapley values via attention-mask intervention.
 
-    n = len(players)
-    phi = {}
-    for player in players:
-        total = 0.0
-        others = [p for p in players if p != player]
-        for r in range(len(others) + 1):
-            for subset in itertools.combinations(others, r):
-                subset = tuple(sorted(subset, key=players.index))
-                with_player = tuple(sorted(subset + (player,), key=players.index))
-                weight = math.factorial(len(subset)) * math.factorial(n - len(subset) - 1) / math.factorial(n)
-                total += weight * (values[with_player] - values[subset])
-        phi[player] = float(total)
-
-    return {
-        "players": players,
-        "values": {"+".join(k) if k else "empty": v for k, v in values.items()},
-        "phi": phi,
-    }
+    Thin wrapper around scripts/shapley_attribution.shapley that keeps
+    the original public signature so callers (shapley_rows,
+    process_dataset) do not change. Threads the chat-templated prompt
+    through so Shapley is scored on the exact token sequence the model
+    was conditioned on during inference — masking is then a pure
+    intervention, not a distribution shift.
+    """
+    auth = build_auth(sample)
+    data = build_data(sample.get("data_fact", ""), sample.get("data_attack", ""))
+    prompt_text = chat_text(model, auth, data, add_generation_prompt=True)
+    return _shapley_impl(model, sample, output_text, granularity, prompt_text=prompt_text)
 
 
 def looks_like_clean_answer(output: str, clean_label: str | None) -> bool:
