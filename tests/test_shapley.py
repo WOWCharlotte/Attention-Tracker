@@ -163,12 +163,29 @@ class RegionSpansTest(unittest.TestCase):
         }
 
     def _fake_tokenizer(self):
-        """A minimal tokenizer that splits on whitespace and known markers."""
+        """A minimal tokenizer with offsets for span assertions."""
 
         class Tok:
             def encode(self, text, add_special_tokens=True):
                 # Naive whitespace split; good enough for span assertions.
                 return text.split()
+
+            def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+                pieces = []
+                start = None
+                for i, ch in enumerate(text):
+                    if ch.isspace():
+                        if start is not None:
+                            pieces.append((start, i))
+                            start = None
+                    elif start is None:
+                        start = i
+                if start is not None:
+                    pieces.append((start, len(text)))
+                payload = {"input_ids": list(range(len(pieces)))}
+                if return_offsets_mapping:
+                    payload["offset_mapping"] = pieces
+                return payload
 
         return Tok()
 
@@ -250,6 +267,61 @@ class RegionSpansTest(unittest.TestCase):
         f_start, f_end = spans["data_fact"]
         self.assertLessEqual(d_start, f_start)
         self.assertGreaterEqual(d_end, f_end)
+
+    def test_none_like_data_attack_is_treated_as_empty(self):
+        """Placeholder attack text like 'None.' should not create an ATTACK player span."""
+        sample = {
+            "system": "x",
+            "user": "y",
+            "data_fact": "fact text",
+            "data_attack": "None.",
+        }
+        model = type("M", (), {"tokenizer": self._fake_tokenizer()})()
+        auth = shap.build_auth(sample)
+        data = shap.build_data(sample["data_fact"], sample["data_attack"])
+        prompt = auth + "\n\n" + data
+        spans = shap.extract_region_spans(model, prompt, sample, granularity="fine")
+        self.assertNotIn("data_attack", spans)
+        self.assertIn("data_fact", spans)
+        self.assertEqual(shap.normalize_attack_text("None."), "")
+
+    def test_offset_mapping_avoids_context_sensitive_token_mismatch(self):
+        """Span extraction should work even if isolated tokenization differs
+        from tokenization inside the full prompt."""
+        sample = self._make_sample()
+
+        class ContextTok:
+            def encode(self, text, add_special_tokens=True):
+                # Deliberately makes isolated snippets incompatible with
+                # the full-prompt segmentation, simulating subword
+                # boundary drift across contexts.
+                return [f"solo::{text}"]
+
+            def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+                offsets = []
+                start = None
+                for i, ch in enumerate(text):
+                    if ch.isspace():
+                        if start is not None:
+                            offsets.append((start, i))
+                            start = None
+                    elif start is None:
+                        start = i
+                if start is not None:
+                    offsets.append((start, len(text)))
+                payload = {"input_ids": list(range(len(offsets)))}
+                if return_offsets_mapping:
+                    payload["offset_mapping"] = offsets
+                return payload
+
+        model = type("M", (), {"tokenizer": ContextTok()})()
+        auth = shap.build_auth(sample)
+        data = shap.build_data(sample["data_fact"], sample["data_attack"])
+        prompt = auth + "\n\n" + data
+        spans = shap.extract_region_spans(model, prompt, sample, granularity="fine")
+        self.assertIn("auth", spans)
+        self.assertIn("data_fact", spans)
+        self.assertIn("data_attack", spans)
 
 
 class MaskedEmbedLogprobTest(unittest.TestCase):

@@ -71,6 +71,7 @@ AUTH_KEY = "auth"
 DATA_KEY = "data"
 FACT_KEY = "data_fact"
 ATTACK_KEY = "data_attack"
+NONE_LIKE_TEXTS = {"", "none", "none.", "null", "null.", "n/a", "na"}
 
 
 def compute_shapley_values(
@@ -118,8 +119,19 @@ def build_auth(sample: dict) -> str:
     return f"<system>\n{sample['system']}\n</system>\n\n<user>\n{sample['user']}\n</user>"
 
 
+def normalize_attack_text(value) -> str:
+    """Normalize placeholder / missing attack text to the empty string."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in NONE_LIKE_TEXTS:
+        return ""
+    return text
+
+
 def build_data(data_fact: str, data_attack: str) -> str:
     """Re-export so callers don't need to import the main script."""
+    data_attack = normalize_attack_text(data_attack)
     return (
         "<data>\n"
         "<data_fact>\n"
@@ -141,13 +153,13 @@ def _build_prompt(sample: dict) -> str:
     Shapley is scored on the exact same token sequence the model was
     conditioned on at inference time.
     """
-    return f"{build_auth(sample)}\n\n{build_data(sample.get('data_fact', ''), sample.get('data_attack', ''))}"
+    return f"{build_auth(sample)}\n\n{build_data(sample.get('data_fact', ''), normalize_attack_text(sample.get('data_attack', '')))}"
 
 
 def build_chat_prompt(model, sample: dict, add_generation_prompt: bool = True) -> str:
     """Build the same chat-templated prompt used by the Qwen shift experiment."""
     auth = build_auth(sample)
-    data = build_data(sample.get("data_fact", ""), sample.get("data_attack", ""))
+    data = build_data(sample.get("data_fact", ""), normalize_attack_text(sample.get("data_attack", "")))
     if getattr(model, "provider", "") == "attn-hf-no-sys":
         messages = [
             {"role": "user", "content": auth + "\nData: " + data},
@@ -192,51 +204,69 @@ def extract_region_spans(
     Spans are inclusive-exclusive [start, end) over the tokenized prompt.
     Missing or empty regions are simply omitted from the result.
     """
-    prompt_ids = _tokenize_piece(model, prompt)
-    if not prompt_ids:
-        return {}
-
     spans: Dict[str, Tuple[int, int]] = {}
+    prompt_token_spans = _prompt_token_spans(model, prompt)
+    if not prompt_token_spans:
+        return {}
 
     # 1. auth region: from <system> to </user> inclusive of the wrapper text.
     auth_text = build_auth(sample)
-    auth_ids = _tokenize_piece(model, auth_text)
-    auth_span = _find_token_span(prompt_ids, auth_ids, start=0)
-    if auth_span:
+    auth_chars = _find_text_span(prompt, auth_text, start=0)
+    if auth_chars is not None:
+        auth_span = _token_span_from_char_span(prompt_token_spans, *auth_chars)
+    else:
+        auth_span = None
+    if auth_span is not None:
         spans[AUTH_KEY] = auth_span
 
     # 2. data_fact and data_attack regions.
     fact_text = sample.get("data_fact", "")
-    attack_text = sample.get("data_attack", "")
+    attack_text = normalize_attack_text(sample.get("data_attack", ""))
 
     # Both regions sit inside the data block. Anchor on the data block
     # to keep fact/attack search ranges small and bounded.
     data_block_text = build_data(fact_text, attack_text)
-    data_block_ids = _tokenize_piece(model, data_block_text)
-    data_block_span = _find_token_span(prompt_ids, data_block_ids, start=spans.get(AUTH_KEY, (0, 0))[1])
-    data_block_start = data_block_span[0] if data_block_span else len(prompt_ids)
+    auth_char_end = auth_chars[1] if auth_chars is not None else 0
+    data_block_chars = _find_text_span(prompt, data_block_text, start=auth_char_end)
+    if data_block_chars is not None:
+        data_block_span = _token_span_from_char_span(
+            prompt_token_spans, data_block_chars[0], data_block_chars[1]
+        )
+        data_block_text_start = data_block_chars[0]
+    else:
+        data_block_span = None
+        data_block_text_start = len(prompt)
 
     fact_span: Tuple[int, int] | None = None
     attack_span: Tuple[int, int] | None = None
     if fact_text:
-        fact_ids = _tokenize_piece(model, fact_text)
-        # Search inside the data block.
-        local = _find_token_span(
-            data_block_ids, fact_ids, start=0, end=len(data_block_ids)
-        )
-        if local is not None:
-            fact_span = (data_block_start + local[0], data_block_start + local[1])
+        local_chars = _find_text_span(data_block_text, fact_text, start=0)
+        if local_chars is not None:
+            fact_span = _token_span_from_char_span(
+                prompt_token_spans,
+                data_block_text_start + local_chars[0],
+                data_block_text_start + local_chars[1],
+            )
+        if fact_span is not None:
             spans[FACT_KEY] = fact_span
 
     if attack_text:
         # Search after the fact region to avoid matching against fact content.
-        start_after_fact = 0 if fact_span is None else (fact_span[1] - data_block_start)
-        attack_ids = _tokenize_piece(model, attack_text)
-        local = _find_token_span(
-            data_block_ids, attack_ids, start=start_after_fact, end=len(data_block_ids)
+        start_after_fact_chars = 0
+        if fact_text:
+            fact_chars_in_data = _find_text_span(data_block_text, fact_text, start=0)
+            if fact_chars_in_data is not None:
+                start_after_fact_chars = fact_chars_in_data[1]
+        local_chars = _find_text_span(
+            data_block_text, attack_text, start=start_after_fact_chars
         )
-        if local is not None:
-            attack_span = (data_block_start + local[0], data_block_start + local[1])
+        if local_chars is not None:
+            attack_span = _token_span_from_char_span(
+                prompt_token_spans,
+                data_block_text_start + local_chars[0],
+                data_block_text_start + local_chars[1],
+            )
+        if attack_span is not None:
             spans[ATTACK_KEY] = attack_span
 
     # 3. Coarse data span = union of fact + attack spans.
@@ -250,6 +280,47 @@ def extract_region_spans(
             spans[DATA_KEY] = data_block_span
 
     return spans
+
+
+def _find_text_span(text: str, needle: str, start: int = 0) -> Tuple[int, int] | None:
+    """Find a literal substring span [start, end) in character space."""
+    if not needle:
+        return None
+    pos = text.find(needle, start)
+    if pos < 0:
+        return None
+    return pos, pos + len(needle)
+
+
+def _prompt_token_spans(model, prompt: str) -> List[Tuple[int, int]]:
+    """Return per-token character offsets for the full prompt."""
+    encoded = model.tokenizer(
+        prompt,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+    )
+    offsets = encoded.get("offset_mapping")
+    if offsets is None:
+        raise ValueError(
+            "Tokenizer does not provide offset_mapping, which is required "
+            "for robust Shapley span extraction."
+        )
+    return [(int(start), int(end)) for start, end in offsets]
+
+
+def _token_span_from_char_span(
+    offsets: List[Tuple[int, int]],
+    char_start: int,
+    char_end: int,
+) -> Tuple[int, int] | None:
+    """Map a character span [char_start, char_end) to a token span [i, j)."""
+    indices = [
+        i for i, (start, end) in enumerate(offsets)
+        if end > char_start and start < char_end
+    ]
+    if not indices:
+        return None
+    return indices[0], indices[-1] + 1
 
 
 def _find_token_span(
@@ -330,7 +401,7 @@ def logprob_with_masked_regions(
     # Build the full sequence by concatenating prompt + output IDs.
     # We re-embed only the output portion; prompt embeddings are already
     # prepared and possibly masked.
-    embed_layer = model.get_input_embeddings()
+    embed_layer = _get_input_embedding_layer(model)
     output_embeds = embed_layer(output_ids)
     full_embeds = torch.cat([embeds, output_embeds], dim=1)
     # Keep the attention mask fully visible. Shapley masking is an
@@ -403,7 +474,7 @@ def shapley(
 
     # Embed the prompt once; every coalition clones and masks this tensor.
     prompt_ids = _tokenize_piece(model, prompt_text)
-    embed_layer = model.get_input_embeddings()
+    embed_layer = _get_input_embedding_layer(model)
     prompt_embeds = embed_layer(
         torch.tensor([prompt_ids], device=_device_of(model))
     )
@@ -504,6 +575,18 @@ def _device_of(model) -> "torch.device":
     return torch.device("cpu")
 
 
+def _get_input_embedding_layer(model):
+    """Resolve the HF input embeddings from either a wrapper or raw model."""
+    if hasattr(model, "get_input_embeddings"):
+        return model.get_input_embeddings()
+    if hasattr(model, "model") and hasattr(model.model, "get_input_embeddings"):
+        return model.model.get_input_embeddings()
+    raise AttributeError(
+        f"{type(model).__name__} does not expose get_input_embeddings() "
+        "either directly or via `.model`."
+    )
+
+
 def _tokenize_output(model, output_text: str) -> List[int]:
     """Encode `output_text` into token IDs (no special tokens)."""
     return model.tokenizer.encode(output_text, add_special_tokens=False)
@@ -530,7 +613,7 @@ def main() -> None:
     parser.add_argument(
         "--granularity",
         choices=["both", "coarse", "fine"],
-        default="both",
+        default="coarse",
         help="Which Shapley granularity to compute.",
     )
     args = parser.parse_args()
