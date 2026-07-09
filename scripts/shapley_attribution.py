@@ -18,14 +18,51 @@ Public API:
     extract_region_spans(model, prompt, sample, granularity) -> dict
     logprob_with_masked_regions(...) -> float
     shapley(model, sample, output_text, granularity) -> dict
+    shapley_rows(model, rows, scope) -> list[dict]
 """
 
+"""
+Complete computation process
+ 1. Build the exact chat-templated prompt used at inference time from
+    `<system>`, `<user>`, `<data_fact>`, and `<data_attack>`.
+ 2. Define players according to the scheme in the design doc:
+    coarse = [`auth`, `data`], fine = [`auth`, `data_fact`, `data_attack`].
+ 3. Tokenize the full prompt once and locate each player's token span in
+    that exact prompt.
+ 4. Embed the prompt once with the model's input embedding layer.
+ 5. For each coalition S, keep the full token sequence unchanged and only
+    zero the embeddings of players not in S.
+ 6. Concatenate masked prompt embeddings with the generated output tokens O
+    and compute `v(S) = log P_theta(O | X_S)`.
+ 7. Enumerate the complete coalition-value table and compute exact Shapley
+    values from weighted marginal contributions.
+
+ Why the Attention mask is preserved
+ - We do not delete tokens.
+ - We do not insert placeholder text.
+ - We keep sequence length, token positions, and the all-ones attention
+   mask unchanged across coalitions.
+ - Only embeddings are perturbed, so the measured difference is attributed
+   to region semantics rather than prompt-length or masking-side effects.
+"""
+
+
+import argparse
 import itertools
+import json
 import math
+import os
+import sys
 from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 # Player keys match the keys used in run_qwen3_shift_experiment.py so the
@@ -78,7 +115,7 @@ def compute_shapley_values(
 
 def build_auth(sample: dict) -> str:
     """Re-export so callers don't need to import the main script."""
-    return f"<system>\n{sample['system']}\n</system>\n\n<user>\n{sample['user']}</user>"
+    return f"<system>\n{sample['system']}\n</system>\n\n<user>\n{sample['user']}\n</user>"
 
 
 def build_data(data_fact: str, data_attack: str) -> str:
@@ -105,6 +142,27 @@ def _build_prompt(sample: dict) -> str:
     conditioned on at inference time.
     """
     return f"{build_auth(sample)}\n\n{build_data(sample.get('data_fact', ''), sample.get('data_attack', ''))}"
+
+
+def build_chat_prompt(model, sample: dict, add_generation_prompt: bool = True) -> str:
+    """Build the same chat-templated prompt used by the Qwen shift experiment."""
+    auth = build_auth(sample)
+    data = build_data(sample.get("data_fact", ""), sample.get("data_attack", ""))
+    if getattr(model, "provider", "") == "attn-hf-no-sys":
+        messages = [
+            {"role": "user", "content": auth + "\nData: " + data},
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": auth},
+            {"role": "user", "content": "Data: " + data},
+        ]
+    return model.tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=False,
+    )
 
 
 def _tokenize_piece(model, text: str) -> List[int]:
@@ -275,6 +333,9 @@ def logprob_with_masked_regions(
     embed_layer = model.get_input_embeddings()
     output_embeds = embed_layer(output_ids)
     full_embeds = torch.cat([embeds, output_embeds], dim=1)
+    # Keep the attention mask fully visible. Shapley masking is an
+    # embedding-level intervention, so positions and attention-mask shape
+    # remain identical across every coalition.
     attention_mask = torch.ones(
         full_embeds.shape[:2], device=full_embeds.device, dtype=torch.long
     )
@@ -368,6 +429,72 @@ def shapley(
     }
 
 
+def select_rows_for_shapley(rows: List[dict], scope: str) -> List[dict]:
+    """Select rows for standalone Shapley attribution."""
+    if scope == "candidates":
+        return [row for row in rows if row.get("candidate_attention_shift_attack_failed")]
+    if scope == "attention_shift":
+        return [row for row in rows if row.get("attention_shift")]
+    if scope == "all":
+        return list(rows)
+    raise ValueError(f"Unknown Shapley scope: {scope!r}")
+
+
+def shapley_for_row(
+    model,
+    row: dict,
+    granularities: Iterable[str] = ("coarse", "fine"),
+) -> dict:
+    """Attach Shapley results to one experiment result row."""
+    sample = row["sample"]
+    output = row["output"]
+    prompt_text = build_chat_prompt(model, sample, add_generation_prompt=True)
+    for granularity in granularities:
+        row[f"shapley_{granularity}"] = shapley(
+            model,
+            sample,
+            output,
+            granularity,
+            prompt_text=prompt_text,
+        )
+    return row
+
+
+def shapley_rows(
+    model,
+    rows: List[dict],
+    scope: str = "candidates",
+    granularities: Iterable[str] = ("coarse", "fine"),
+) -> List[dict]:
+    """Compute Shapley values for selected rows from an experiment JSONL."""
+    work_rows = select_rows_for_shapley(rows, scope)
+    for row in tqdm(work_rows, desc="shapley"):
+        shapley_for_row(model, row, granularities)
+    return work_rows
+
+
+def read_jsonl(path: str, limit: int | None = None) -> List[dict]:
+    if limit == 0:
+        return []
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+            if limit is not None and len(rows) >= limit:
+                break
+    return rows
+
+
+def write_jsonl(path: str, rows: Iterable[dict]) -> None:
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def _device_of(model) -> "torch.device":
     """Resolve the device the model lives on."""
     if hasattr(model, "model") and hasattr(model.model, "device"):
@@ -380,3 +507,48 @@ def _device_of(model) -> "torch.device":
 def _tokenize_output(model, output_text: str) -> List[int]:
     """Encode `output_text` into token IDs (no special tokens)."""
     return model.tokenizer.encode(output_text, add_special_tokens=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute coarse/fine Shapley attribution for JSONL rows produced "
+            "by run_qwen3_shift_experiment.py. Interventions zero selected "
+            "region embeddings while keeping the attention mask unchanged."
+        )
+    )
+    parser.add_argument("--model_name", default="qwen3_8b-attn")
+    parser.add_argument("--input", required=True, help="Input experiment JSONL.")
+    parser.add_argument("--output", required=True, help="Output JSONL with Shapley fields.")
+    parser.add_argument("--limit", type=int, help="Optional maximum rows to read.")
+    parser.add_argument(
+        "--shapley_scope",
+        choices=["candidates", "attention_shift", "all"],
+        default="candidates",
+        help="Rows to compute Shapley for.",
+    )
+    parser.add_argument(
+        "--granularity",
+        choices=["both", "coarse", "fine"],
+        default="both",
+        help="Which Shapley granularity to compute.",
+    )
+    args = parser.parse_args()
+
+    from utils import create_model, open_config
+
+    granularities = ("coarse", "fine") if args.granularity == "both" else (args.granularity,)
+    rows = read_jsonl(args.input, args.limit)
+    config = open_config(f"./configs/model_configs/{args.model_name}_config.json")
+    model = create_model(config)
+    attributed = shapley_rows(
+        model,
+        rows,
+        scope=args.shapley_scope,
+        granularities=granularities,
+    )
+    write_jsonl(args.output, attributed)
+
+
+if __name__ == "__main__":
+    main()

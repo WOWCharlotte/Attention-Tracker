@@ -19,7 +19,7 @@ from tqdm import tqdm
 from detector.attn import AttentionDetector
 from detector.utils import process_attn
 from utils import create_model, open_config
-from shapley_attribution import shapley as _shapley_impl
+from shapley_attribution import shapley_for_row, shapley_rows as compute_shapley_rows
 
 
 AUTH_KEY = "auth"
@@ -356,22 +356,6 @@ def chat_text(model, auth: str, data: str, add_generation_prompt: bool = True) -
     )
 
 
-def shapley(model, sample: dict, output_text: str, granularity: str) -> dict:
-    """Compute Shapley values via attention-mask intervention.
-
-    Thin wrapper around scripts/shapley_attribution.shapley that keeps
-    the original public signature so callers (shapley_rows,
-    process_dataset) do not change. Threads the chat-templated prompt
-    through so Shapley is scored on the exact token sequence the model
-    was conditioned on during inference — masking is then a pure
-    intervention, not a distribution shift.
-    """
-    auth = build_auth(sample)
-    data = build_data(sample.get("data_fact", ""), sample.get("data_attack", ""))
-    prompt_text = chat_text(model, auth, data, add_generation_prompt=True)
-    return _shapley_impl(model, sample, output_text, granularity, prompt_text=prompt_text)
-
-
 def looks_like_clean_answer(output: str, clean_label: str | None) -> bool:
     text = output.lower()
     clean = (clean_label or "").strip().lower()
@@ -660,23 +644,6 @@ def judge_rows(rows: List[dict], judge: InjectionJudge, args) -> List[dict]:
     return judged
 
 
-def shapley_rows(model, rows: List[dict], args) -> List[dict]:
-    if args.shapley_scope == "candidates":
-        work_rows = [row for row in rows if row.get("candidate_attention_shift_attack_failed")]
-    elif args.shapley_scope == "attention_shift":
-        work_rows = [row for row in rows if row.get("attention_shift")]
-    else:
-        work_rows = rows
-
-    results = []
-    for row in tqdm(work_rows, desc="shapley"):
-        sample = row["sample"]
-        row["shapley_coarse"] = shapley(model, sample, row["output"], "coarse")
-        row["shapley_fine"] = shapley(model, sample, row["output"], "fine")
-        results.append(row)
-    return results
-
-
 def summarize(rows: List[dict]) -> dict:
     summary = {
         "total": len(rows),
@@ -732,8 +699,7 @@ def process_dataset(model, detector, judge: InjectionJudge, dataset_name: str, r
         judge_result = judge.judge(sample, output)
         row = build_result_row(dataset_name, sample, output, attn, judge_result)
         if args.shapley:
-            row["shapley_coarse"] = shapley(model, sample, output, "coarse")
-            row["shapley_fine"] = shapley(model, sample, output, "fine")
+            shapley_for_row(model, row)
         results.append(row)
         if attention_record:
             attention_records.append(attention_record)
@@ -843,7 +809,7 @@ def main() -> None:
         rows = read_jsonl(args.input)
         config = open_config(f"./configs/model_configs/{args.model_name}_config.json")
         model = create_model(config)
-        rows = shapley_rows(model, rows, args)
+        rows = compute_shapley_rows(model, rows, scope=args.shapley_scope)
         write_jsonl(args.output, rows)
         write_summary(args.output, rows)
         return

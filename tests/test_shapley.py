@@ -310,6 +310,69 @@ class MaskedEmbedLogprobTest(unittest.TestCase):
         self.assertEqual(lp, float("-inf"))
 
 
+class StandaloneShapleyRowsTest(unittest.TestCase):
+    """Tests for the standalone JSONL row-level Shapley workflow."""
+
+    def test_select_rows_for_shapley_respects_scope(self):
+        rows = [
+            {"id": "candidate", "candidate_attention_shift_attack_failed": True, "attention_shift": True},
+            {"id": "shift_only", "candidate_attention_shift_attack_failed": False, "attention_shift": True},
+            {"id": "other", "candidate_attention_shift_attack_failed": False, "attention_shift": False},
+        ]
+
+        self.assertEqual(
+            [r["id"] for r in shap.select_rows_for_shapley(rows, "candidates")],
+            ["candidate"],
+        )
+        self.assertEqual(
+            [r["id"] for r in shap.select_rows_for_shapley(rows, "attention_shift")],
+            ["candidate", "shift_only"],
+        )
+        self.assertEqual(
+            [r["id"] for r in shap.select_rows_for_shapley(rows, "all")],
+            ["candidate", "shift_only", "other"],
+        )
+
+    def test_shapley_rows_adds_coarse_and_fine_results(self):
+        calls = []
+        original = shap.shapley
+
+        def fake_shapley(model, sample, output_text, granularity, prompt_text=None):
+            calls.append((sample["system"], output_text, granularity, prompt_text is not None))
+            return {"players": [granularity], "values": {"empty": 0.0}, "phi": {granularity: 1.0}}
+
+        try:
+            shap.shapley = fake_shapley
+            rows = [
+                {
+                    "id": "r1",
+                    "candidate_attention_shift_attack_failed": True,
+                    "attention_shift": True,
+                    "sample": {
+                        "system": "sys",
+                        "user": "usr",
+                        "data_fact": "fact",
+                        "data_attack": "attack",
+                    },
+                    "output": "answer",
+                }
+            ]
+            result = shap.shapley_rows(model=_StubChatModel(), rows=rows, scope="candidates")
+        finally:
+            shap.shapley = original
+
+        self.assertEqual(result, rows)
+        self.assertEqual(result[0]["shapley_coarse"]["players"], ["coarse"])
+        self.assertEqual(result[0]["shapley_fine"]["players"], ["fine"])
+        self.assertEqual(
+            calls,
+            [
+                ("sys", "answer", "coarse", True),
+                ("sys", "answer", "fine", True),
+            ],
+        )
+
+
 class _StubModel:
     """A deterministic stub model for testing masked-embed logprob.
 
@@ -390,6 +453,18 @@ class _StubModel:
         log_probs = torch.log_softmax(logits[:, start:end, :].float(), dim=-1)
         gathered = log_probs.gather(2, output_ids.unsqueeze(-1)).squeeze(-1)
         return float(gathered.sum().item())
+
+
+class _StubChatModel:
+    provider = "attn-hf"
+
+    class _Tok:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            assert tokenize is False
+            suffix = "\n<assistant>" if add_generation_prompt else ""
+            return "\n".join(f"{m['role']}:{m['content']}" for m in messages) + suffix
+
+    tokenizer = _Tok()
 
 
 if __name__ == "__main__":
