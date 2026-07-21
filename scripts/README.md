@@ -295,3 +295,50 @@ python scripts/visualize_attention_tokens.py \
 - **Shapley 极慢**：每次 Shapley 需要 `2^N` 次前向传播（`coarse` 4 次、`fine` 8 次）。可通过 `--shapley_scope candidates` 把范围限定在反例上，必要时配合 `--limit_bipia / --limit_hotpotqa` 进一步缩小。
 - **`important_heads` 缺失或不一致**：重新跑 `scripts/find_heads.sh` 或参考 `select_head.py` 重新挑选 Qwen3-8B 的重要 head。
 - **注意力区间错位 / 可视化异常**：参考第 9.6 节，用 `--repair_regions_from_results` 修复 FACT/ATTACK 区域。
+## InjecAgent action-level Attention + Shapley
+
+Run the Direct Harm base experiment on the pre-generated Qwen3-8B outputs:
+
+```bash
+python scripts/injecagent_action_experiment.py
+```
+
+Default inputs:
+
+- `data/injecagent/qwen3-8b/test_cases_dh_base.jsonl`
+- `data/injecagent/injecagent_data/test_cases_dh_base.json`
+- `data/injecagent/injecagent_data/tools.json`
+
+Default outputs:
+
+- `result/injecagent_qwen3_dh/results.action_shapley.jsonl`
+- `result/injecagent_qwen3_dh/results.action_attention.jsonl`
+- `result/injecagent_qwen3_dh/results.action_shapley.summary.json`
+- `result/injecagent_qwen3_dh/shapley_action_gallery.html`
+
+Useful smoke checks:
+
+```bash
+python scripts/injecagent_action_experiment.py --validate_only
+python scripts/injecagent_action_experiment.py --limit 5 --skip_attention
+```
+
+Render the InjecAgent-specific action attribution gallery:
+
+```bash
+python scripts/visualize_injecagent_actions.py \
+  --shapley result/injecagent_qwen3_dh/results.action_shapley.jsonl \
+  --attention result/injecagent_qwen3_dh/results.action_attention.jsonl \
+  --output result/injecagent_qwen3_dh/injecagent_action_attribution.html \
+  --all
+```
+
+Render one case only:
+
+```bash
+python scripts/visualize_injecagent_actions.py \
+  --shapley result/injecagent_qwen3_dh/results.action_shapley.jsonl \
+  --attention result/injecagent_qwen3_dh/results.action_attention.jsonl \
+  --output result/injecagent_qwen3_dh/injecagent_action_case0.html \
+  --case_id 0
+```
