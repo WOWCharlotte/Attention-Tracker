@@ -47,13 +47,27 @@ class VisualizeInjecAgentActionsTest(unittest.TestCase):
             {
                 "7": {
                     "case_id": 7,
+                    "attention_shift": True,
                     "attention_shift_attack": True,
-                    "region_scores": {"auth": 0.1, "data_fact": 0.2, "data_attack": 0.8},
+                    "attention_shift_basis": "auth_focus_score<=threshold_excluding_special",
+                    "auth_focus_score": 0.0909,
+                    "threshold": 0.5,
+                    "attention_attack_dominant": True,
+                    "region_scores": {"auth": 0.1, "data_fact": 0.2, "data_attack": 0.8, "special": 8.9},
+                    "region_scores_normalized": {"auth": 0.01, "data_fact": 0.02, "data_attack": 0.08, "special": 0.89},
+                    "region_scores_player_normalized": {
+                        "auth": 0.0909,
+                        "data_fact": 0.1818,
+                        "data_attack": 0.7273,
+                    },
+                    "player_attention_mass": 1.1,
                     "top_tokens": [{"i": 1, "t": "Bank", "s": 0.8, "r": "data_attack"}],
                 }
             },
         )
+        self.assertTrue(row["attention_shift"])
         self.assertTrue(row["attention_shift_attack"])
+        self.assertTrue(row["attention_attack_dominant"])
         self.assertIn("attention", row)
 
     def test_render_html_contains_core_sections(self):
@@ -62,8 +76,20 @@ class VisualizeInjecAgentActionsTest(unittest.TestCase):
             {
                 "7": {
                     "case_id": 7,
+                    "attention_shift": True,
                     "attention_shift_attack": True,
-                    "region_scores": {"auth": 0.1, "data_fact": 0.2, "data_attack": 0.8},
+                    "attention_shift_basis": "auth_focus_score<=threshold_excluding_special",
+                    "auth_focus_score": 0.0909,
+                    "threshold": 0.5,
+                    "attention_attack_dominant": True,
+                    "region_scores": {"auth": 0.1, "data_fact": 0.2, "data_attack": 0.8, "special": 8.9},
+                    "region_scores_normalized": {"auth": 0.01, "data_fact": 0.02, "data_attack": 0.08, "special": 0.89},
+                    "region_scores_player_normalized": {
+                        "auth": 0.0909,
+                        "data_fact": 0.1818,
+                        "data_attack": 0.7273,
+                    },
+                    "player_attention_mass": 1.1,
                     "top_tokens": [{"i": 1, "t": "Bank", "s": 0.8, "r": "data_attack"}],
                 }
             },
@@ -74,6 +100,27 @@ class VisualizeInjecAgentActionsTest(unittest.TestCase):
         self.assertIn("Tokens", html)
         self.assertIn('data-filter="auth"', html)
         self.assertIn("ATTACK MARGIN", html)
+        self.assertIn("Prompt Mass", html)
+        self.assertIn("Player Mass", html)
+        self.assertIn("Auth Focus", html)
+        self.assertIn("Threshold", html)
+        self.assertIn("Attack Dominant", html)
+        self.assertIn("Player-Normalized Attention", html)
+        self.assertIn("Prompt-Normalized Attention", html)
+        self.assertIn('<details class="attention-details">', html)
+        self.assertNotIn('<details class="attention-details" open>', html)
+        self.assertIn("player norm 0.7273", html)
+        self.assertIn("prompt norm 0.89", html)
+        self.assertIn('<details class="record" id="case-7" open>', html)
+
+    def test_unsuccessful_non_shift_case_is_collapsed(self):
+        row = dict(self._row())
+        row["eval"] = "unsucc"
+        row["attention_shift"] = False
+        row["attention_shift_attack"] = False
+        html = viz.render_html([row], {"shapley": "s.jsonl", "attention": "a.jsonl"}, "Demo")
+        self.assertIn('<details class="record" id="case-7">', html)
+        self.assertNotIn('<details class="record" id="case-7" open>', html)
 
 
 if __name__ == "__main__":

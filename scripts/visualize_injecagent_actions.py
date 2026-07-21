@@ -70,9 +70,15 @@ def merge_attention(row: dict, attn_by_case: dict[str, dict]) -> dict:
     attention = attn_by_case.get(str(row.get("case_id")))
     if attention:
         row["attention"] = attention
-        row.setdefault("attention_shift_attack", attention.get("attention_shift_attack"))
+        row.setdefault("attention_shift", attention.get("attention_shift", attention.get("attention_shift_attack")))
+        row.setdefault("attention_shift_attack", attention.get("attention_shift_attack", attention.get("attention_shift")))
+        row.setdefault("attention_attack_dominant", attention.get("attention_attack_dominant"))
         row.setdefault("attention_region_scores", attention.get("region_scores"))
     return row
+
+
+def should_expand_record(row: dict) -> bool:
+    return str(row.get("eval", "")).lower() == "succ" or bool(row.get("attention_shift", row.get("attention_shift_attack")))
 
 
 def normalize_tool_response(value: str) -> str:
@@ -245,15 +251,54 @@ def render_attention(row: dict) -> str:
     scores = attention.get("region_scores") or row.get("attention_region_scores") or {}
     if not scores:
         return '<section class="panel"><h2>Attention</h2><p class="empty">No attention record found.</p></section>'
-    total = sum(float(v) for v in scores.values()) or 1.0
-    score_rows = []
-    for region in ("auth", "data_fact", "data_attack", "special"):
-        value = float(scores.get(region, 0.0))
-        width = min(value / total * 100.0, 100.0)
-        score_rows.append(
+    prompt_mass = attention.get("prompt_attention_mass")
+    if prompt_mass is None:
+        prompt_mass = sum(float(v) for v in scores.values())
+    prompt_mass = float(prompt_mass)
+    non_prompt_mass = attention.get("non_prompt_attention_mass")
+    if non_prompt_mass is None:
+        non_prompt_mass = max(0.0, 1.0 - prompt_mass)
+    non_prompt_mass = float(non_prompt_mass)
+    normalized = attention.get("region_scores_normalized") or {
+        region: float(value) / (prompt_mass or 1.0)
+        for region, value in scores.items()
+    }
+    player_mass = attention.get("player_attention_mass")
+    if player_mass is None:
+        player_mass = sum(float(scores.get(region, 0.0)) for region in ("auth", "data_fact", "data_attack"))
+    player_mass = float(player_mass)
+    player_normalized = attention.get("region_scores_player_normalized") or {
+        region: float(scores.get(region, 0.0)) / (player_mass or 1.0)
+        for region in ("auth", "data_fact", "data_attack")
+    }
+    player_rows = []
+    for region in ("auth", "data_fact", "data_attack"):
+        raw_value = float(scores.get(region, 0.0))
+        player_value = float(player_normalized.get(region, 0.0))
+        width = min(player_value * 100.0, 100.0)
+        player_rows.append(
             f"""
             <div class="bar-row">
-              <div class="bar-label"><span class="pill {REGION_CLASSES.get(region)}">{REGION_LABELS.get(region)}</span><span>{fmt(value)}</span></div>
+              <div class="bar-label">
+                <span class="pill {REGION_CLASSES.get(region)}">{REGION_LABELS.get(region)}</span>
+                <span class="score-pair">player norm {fmt(player_value)} · raw {fmt(raw_value)}</span>
+              </div>
+              <div class="bar"><span class="fill-attn" style="width:{width:.2f}%"></span></div>
+            </div>
+            """
+        )
+    prompt_rows = []
+    for region in ("auth", "data_fact", "data_attack", "special"):
+        value = float(scores.get(region, 0.0))
+        normalized_value = float(normalized.get(region, 0.0))
+        width = min(normalized_value * 100.0, 100.0)
+        prompt_rows.append(
+            f"""
+            <div class="bar-row">
+              <div class="bar-label">
+                <span class="pill {REGION_CLASSES.get(region)}">{REGION_LABELS.get(region)}</span>
+                <span class="score-pair">prompt norm {fmt(normalized_value)} · raw {fmt(value)}</span>
+              </div>
               <div class="bar"><span class="fill-attn" style="width:{width:.2f}%"></span></div>
             </div>
             """
@@ -287,9 +332,25 @@ def render_attention(row: dict) -> str:
     <section class="panel">
       <div class="section-head">
         <h2>Attention</h2>
-        <span class="chip">Attack shift: {bool_label(row.get("attention_shift_attack"))}</span>
+        <span class="chip">Shift: {bool_label(row.get("attention_shift", row.get("attention_shift_attack")))}</span>
       </div>
-      {''.join(score_rows)}
+      <div class="attention-score-grid">
+        <div class="attention-score"><span>Prompt Mass</span><strong>{fmt(prompt_mass)}</strong></div>
+        <div class="attention-score"><span>Non-Prompt Mass</span><strong>{fmt(non_prompt_mass)}</strong></div>
+        <div class="attention-score"><span>Player Mass</span><strong>{fmt(player_mass)}</strong></div>
+        <div class="attention-score"><span>Auth Focus</span><strong>{fmt(attention.get("auth_focus_score", player_normalized.get("auth")))}</strong></div>
+        <div class="attention-score"><span>Threshold</span><strong>{fmt(attention.get("threshold"))}</strong></div>
+        <div class="attention-score"><span>Attack Dominant</span><strong>{bool_label(attention.get("attention_attack_dominant"))}</strong></div>
+        <div class="attention-score"><span>Prompt-Normalized Sum</span><strong>{fmt(sum(float(normalized.get(region, 0.0)) for region in ("auth", "data_fact", "data_attack", "special")))}</strong></div>
+      </div>
+      <h3 class="mini-heading">Player-Normalized Attention</h3>
+      {''.join(player_rows)}
+      <details class="attention-details">
+        <summary>Prompt-Normalized Attention</summary>
+        <div class="attention-details-body">
+          {''.join(prompt_rows)}
+        </div>
+      </details>
       {tokens_html}
     </section>
     """
@@ -350,8 +411,9 @@ def render_action(row: dict) -> str:
 
 
 def render_record(row: dict) -> str:
+    open_attr = " open" if should_expand_record(row) else ""
     return f"""
-    <details class="record" id="case-{html.escape(str(row.get("case_id")))}" open>
+    <details class="record" id="case-{html.escape(str(row.get("case_id")))}"{open_attr}>
       <summary>
         <span class="case-title">CASE {html.escape(str(row.get("case_id")))} · {html.escape(str(row.get("attack_type", "InjecAgent Action")))}</span>
         <span class="case-meta">{html.escape(str(row.get("eval", "unknown")).upper())} · {html.escape(str(row.get("action_kind", "unknown")))}</span>
@@ -387,7 +449,8 @@ def summary_counts(rows: list[dict]) -> dict:
         "action_kind": dict(Counter(str(row.get("action_kind")) for row in rows)),
         "valid_for_stats": sum(bool(row.get("valid_for_stats")) for row in rows),
         "shapley_attack_dominant": sum(bool(row.get("shapley_attack_dominant")) for row in rows),
-        "attention_shift_attack": sum(bool(row.get("attention_shift_attack")) for row in rows),
+        "attention_shift": sum(bool(row.get("attention_shift", row.get("attention_shift_attack"))) for row in rows),
+        "attention_attack_dominant": sum(bool(row.get("attention_attack_dominant")) for row in rows),
     }
 
 
@@ -396,7 +459,8 @@ def render_summary_cards(counts: dict) -> str:
         ("Records", counts.get("records")),
         ("Valid For Stats", counts.get("valid_for_stats")),
         ("Shapley Attack Dominant", counts.get("shapley_attack_dominant")),
-        ("Attention Shift Attack", counts.get("attention_shift_attack")),
+        ("Attention Shift", counts.get("attention_shift")),
+        ("Attention Attack Dominant", counts.get("attention_attack_dominant")),
         ("Eval", ", ".join(f"{k}: {v}" for k, v in sorted((counts.get("eval") or {}).items()))),
         ("Action Kind", ", ".join(f"{k}: {v}" for k, v in sorted((counts.get("action_kind") or {}).items()))),
     ]
@@ -467,6 +531,7 @@ def render_html(rows: list[dict], source: dict, title: str) -> str:
     .status-card strong {{ font-size: 18px; overflow-wrap: anywhere; }}
     .status-good {{ color: var(--good); }} .status-bad {{ color: var(--bad); }} .status-warn {{ color: var(--warn); }} .status-neutral {{ color: var(--muted); }}
     .section-head, .card-head, .bar-label {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+    .score-pair {{ color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }}
     .chip {{ border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); font-size: 12px; }}
     .phi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 14px; }}
     .phi-card {{ border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; padding: 12px; }}
@@ -476,6 +541,12 @@ def render_html(rows: list[dict], source: dict, title: str) -> str:
     .bar span {{ display: block; height: 100%; border-radius: inherit; }}
     .fill-pos {{ background: var(--fact); }} .fill-neg {{ background: var(--attack); }} .fill-attn {{ background: var(--attn); }}
     .bar-row {{ margin-bottom: 10px; }}
+    .attention-details {{ margin-top: 18px; }}
+    .attention-details > summary {{ cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; width: fit-content; color: var(--muted); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }}
+    .attention-details > summary::-webkit-details-marker {{ display: none; }}
+    .attention-details > summary::before {{ content: ">"; color: var(--muted); }}
+    .attention-details[open] > summary::before {{ content: "v"; }}
+    .attention-details-body {{ margin-top: 10px; }}
     .pill {{ display: inline-block; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font-size: 11px; font-weight: 700; margin-right: 4px; }}
     .region-auth {{ color: var(--auth); }} .region-fact {{ color: var(--fact); }} .region-attack {{ color: var(--attack); }} .region-special, .region-empty {{ color: var(--special); }}
     .table-wrap {{ overflow: auto; border: 1px solid var(--line); border-radius: 8px; }}
@@ -499,6 +570,10 @@ def render_html(rows: list[dict], source: dict, title: str) -> str:
     .token-data_attack {{ background: rgba(180, 35, 24, 0.14); color: var(--attack); }}
     .token-special {{ background: rgba(107, 114, 128, 0.12); color: var(--special); }}
     .token-chip.is-hidden {{ display: none; }}
+    .attention-score-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 14px; }}
+    .attention-score {{ border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; padding: 10px; }}
+    .attention-score span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
+    .attention-score strong {{ font-size: 18px; font-variant-numeric: tabular-nums; }}
     .empty {{ color: var(--muted); font-style: italic; }}
     @media (max-width: 980px) {{
       .layout, .status-grid {{ grid-template-columns: 1fr; }}

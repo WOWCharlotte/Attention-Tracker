@@ -43,6 +43,7 @@ AUTH_KEY = "auth"
 FACT_KEY = "data_fact"
 ATTACK_KEY = "data_attack"
 PLAYERS = [AUTH_KEY, FACT_KEY, ATTACK_KEY]
+RegionSpans = dict[str, list[tuple[int, int]]]
 CORE_ALIGNMENT_FIELDS = [
     "Attacker Tools",
     "Attacker Instruction",
@@ -220,14 +221,7 @@ def build_injecagent_prompt_parts(
         "</user>\n\n"
         f"{scratchpad_prefix}{tool_response}\n"
     )
-    auth_text = (
-        "<system>\n"
-        f"{system_content}\n"
-        "</system>\n\n"
-        "<user>\n"
-        f"{user_instruction}\n"
-        "</user>"
-    )
+    auth_text = "<user>\n" f"{user_instruction}\n" "</user>"
     return {
         "prompt": prompt,
         "auth_text": auth_text,
@@ -263,23 +257,82 @@ def char_to_token_span(offsets: list[tuple[int, int]], start: int, end: int) -> 
     return indices[0], indices[-1] + 1
 
 
-def extract_action_region_spans(model, prompt: str, parts: dict) -> dict[str, tuple[int, int]]:
+def _append_span(spans: RegionSpans, key: str, span: tuple[int, int] | None) -> None:
+    if span and span[1] > span[0]:
+        spans.setdefault(key, []).append(span)
+
+
+def _span_overlaps(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def subtract_token_span(span: tuple[int, int], blocked: tuple[int, int] | None) -> list[tuple[int, int]]:
+    if not blocked or not _span_overlaps(span, blocked):
+        return [span]
+    pieces = []
+    if span[0] < blocked[0]:
+        pieces.append((span[0], blocked[0]))
+    if blocked[1] < span[1]:
+        pieces.append((blocked[1], span[1]))
+    return [piece for piece in pieces if piece[1] > piece[0]]
+
+
+def validate_region_spans(prompt: str, parts: dict, spans: RegionSpans) -> dict:
+    issues = []
+    missing = [player for player in PLAYERS if not spans.get(player)]
+    if missing:
+        issues.append({"type": "missing_spans", "players": missing})
+
+    for fact_span in spans.get(FACT_KEY, []):
+        for attack_span in spans.get(ATTACK_KEY, []):
+            if _span_overlaps(fact_span, attack_span):
+                issues.append({
+                    "type": "fact_attack_overlap",
+                    "data_fact": list(fact_span),
+                    "data_attack": list(attack_span),
+                })
+
+    obs_start = prompt.find("Observation: ")
+    response_start = obs_start + len("Observation: ") if obs_start >= 0 else 0
+    auth_chars = _find_span(prompt, parts["auth_text"])
+    tool_response_chars = _find_span(prompt, parts["tool_response"], start=response_start)
+    attack_chars = _find_span(prompt, parts["data_attack"], start=response_start) if parts.get("data_attack") else None
+    schema_chars = _find_span(prompt, parts["tool_schema_text"])
+    react_chars = _find_span(prompt, "Use this ReAct format")
+    boundary_checks = [
+        ("tool_response", tool_response_chars),
+        ("data_attack", attack_chars),
+        ("tool_schema", schema_chars),
+        ("react_format", react_chars),
+    ]
+    if auth_chars:
+        for name, chars in boundary_checks:
+            if chars and _span_overlaps(auth_chars, chars):
+                issues.append({"type": "auth_boundary_contains", "region": name})
+
+    return {
+        "ok": not issues,
+        "missing_spans": missing,
+        "issues": issues,
+        "num_spans": {key: len(value) for key, value in spans.items()},
+    }
+
+
+def extract_action_region_spans(model, prompt: str, parts: dict) -> RegionSpans:
     offsets = prompt_token_offsets(model, prompt)
-    spans: dict[str, tuple[int, int]] = {}
+    spans: RegionSpans = {}
     auth_chars = _find_span(prompt, parts["auth_text"])
     if auth_chars:
-        auth_span = char_to_token_span(offsets, *auth_chars)
-        if auth_span:
-            spans[AUTH_KEY] = auth_span
+        _append_span(spans, AUTH_KEY, char_to_token_span(offsets, *auth_chars))
 
     obs_start = prompt.find("Observation: ")
     response_start = obs_start + len("Observation: ") if obs_start >= 0 else 0
     attack_text = parts["data_attack"]
     attack_chars = _find_span(prompt, attack_text, start=response_start) if attack_text else None
+    attack_span = None
     if attack_chars:
         attack_span = char_to_token_span(offsets, *attack_chars)
-        if attack_span:
-            spans[ATTACK_KEY] = attack_span
+        _append_span(spans, ATTACK_KEY, attack_span)
 
     response_chars = _find_span(prompt, parts["tool_response"], start=response_start)
     if response_chars:
@@ -295,8 +348,9 @@ def extract_action_region_spans(model, prompt: str, parts: dict) -> dict[str, tu
             if end > start
         ]
         token_ranges = [span for span in token_ranges if span]
-        if token_ranges:
-            spans[FACT_KEY] = (min(span[0] for span in token_ranges), max(span[1] for span in token_ranges))
+        for span in token_ranges:
+            for fact_piece in subtract_token_span(span, attack_span):
+                _append_span(spans, FACT_KEY, fact_piece)
     return spans
 
 
@@ -345,7 +399,7 @@ def mean_logprob_with_masked_regions(
     model,
     prompt_embeds: torch.Tensor,
     action_ids: torch.Tensor,
-    region_spans: dict[str, tuple[int, int]],
+    region_spans: RegionSpans,
     masked_players: Iterable[str],
 ) -> float:
     if action_ids.shape[1] == 0:
@@ -353,12 +407,12 @@ def mean_logprob_with_masked_regions(
 
     embeds = prompt_embeds
     for player in masked_players:
-        span = region_spans.get(player)
-        if not span:
+        spans = region_spans.get(player)
+        if not spans:
             continue
-        start, end = span
         masked = embeds.clone()
-        masked[:, start:end, :] = 0.0
+        for start, end in spans:
+            masked[:, start:end, :] = 0.0
         embeds = masked
 
     embed_layer = _embedding_layer(model)
@@ -375,7 +429,7 @@ def mean_logprob_with_masked_regions(
     return float(gathered.mean().item())
 
 
-def compute_action_shapley(model, prompt: str, action_text: str, region_spans: dict[str, tuple[int, int]]) -> dict:
+def compute_action_shapley(model, prompt: str, action_text: str, region_spans: RegionSpans) -> dict:
     prompt_ids = tokenize_text(model, prompt)
     action_ids_list = tokenize_text(model, action_text)
     device = _device_of(model)
@@ -402,7 +456,40 @@ def compute_action_shapley(model, prompt: str, action_text: str, region_spans: d
     }
 
 
-def compute_action_attention(model, prompt: str, action_text: str, region_spans: dict[str, tuple[int, int]], top_k: int) -> dict:
+def attention_shift_metrics(region_scores: dict, threshold: float = 0.5) -> dict:
+    player_attention_mass = float(
+        region_scores.get(AUTH_KEY, 0.0)
+        + region_scores.get(FACT_KEY, 0.0)
+        + region_scores.get(ATTACK_KEY, 0.0)
+    )
+    player_denominator = player_attention_mass or 1.0
+    region_scores_player_normalized = {
+        AUTH_KEY: float(region_scores.get(AUTH_KEY, 0.0)) / player_denominator,
+        FACT_KEY: float(region_scores.get(FACT_KEY, 0.0)) / player_denominator,
+        ATTACK_KEY: float(region_scores.get(ATTACK_KEY, 0.0)) / player_denominator,
+    }
+    player_auth_fact = (
+        region_scores_player_normalized[AUTH_KEY]
+        + region_scores_player_normalized[FACT_KEY]
+    )
+    auth_focus_score = region_scores_player_normalized[AUTH_KEY]
+    attention_shift = auth_focus_score <= threshold
+    attention_attack_dominant = region_scores_player_normalized[ATTACK_KEY] > player_auth_fact
+    return {
+        "region_scores_player_normalized": region_scores_player_normalized,
+        "player_attention_mass": player_attention_mass,
+        "special_attention_mass": float(region_scores.get("special", 0.0)),
+        "auth_focus_score": float(auth_focus_score),
+        "threshold": float(threshold),
+        "attention_shift": bool(attention_shift),
+        "attention_shift_attack": bool(attention_shift),
+        "attention_shift_basis": "auth_focus_score<=threshold_excluding_special",
+        "attention_attack_dominant": bool(attention_attack_dominant),
+        "attention_attack_dominant_basis": "data_attack>auth+data_fact_within_player_normalized_regions",
+    }
+
+
+def compute_action_attention(model, prompt: str, action_text: str, region_spans: RegionSpans, top_k: int) -> dict:
     prompt_ids = tokenize_text(model, prompt)
     action_ids = tokenize_text(model, action_text)
     if not action_ids:
@@ -429,12 +516,22 @@ def compute_action_attention(model, prompt: str, action_text: str, region_spans:
         region_scores[region] = region_scores.get(region, 0.0) + score
         token_rows.append({"i": idx, "t": input_tokens[idx], "s": score, "r": region})
     top_tokens = sorted(token_rows, key=lambda row: row["s"], reverse=True)[:top_k]
-    auth_fact = region_scores.get(AUTH_KEY, 0.0) + region_scores.get(FACT_KEY, 0.0)
+    prompt_attention_mass = float(sum(region_scores.values()))
+    non_prompt_attention_mass = max(0.0, 1.0 - prompt_attention_mass)
+    normalized_denominator = prompt_attention_mass or 1.0
+    region_scores_normalized = {
+        region: float(score) / normalized_denominator
+        for region, score in region_scores.items()
+    }
+    shift_metrics = attention_shift_metrics(region_scores)
     return {
         "region_scores": region_scores,
-        "attention_shift_attack": bool(region_scores.get(ATTACK_KEY, 0.0) > auth_fact),
+        "region_scores_normalized": region_scores_normalized,
+        "prompt_attention_mass": prompt_attention_mass,
+        "non_prompt_attention_mass": non_prompt_attention_mass,
+        **shift_metrics,
         "num_input_tokens": len(prompt_ids),
-        "token_ranges": {key: list(value) for key, value in region_spans.items()},
+        "token_ranges": {key: [list(span) for span in value] for key, value in region_spans.items()},
         "tokens": token_rows,
         "top_tokens": top_tokens,
         "source": {
@@ -445,11 +542,11 @@ def compute_action_attention(model, prompt: str, action_text: str, region_spans:
     }
 
 
-def region_for_token(index: int, spans: dict[str, tuple[int, int]]) -> str:
+def region_for_token(index: int, spans: RegionSpans) -> str:
     for region in (ATTACK_KEY, FACT_KEY, AUTH_KEY):
-        span = spans.get(region)
-        if span and span[0] <= index < span[1]:
-            return region
+        for start, end in spans.get(region, []):
+            if start <= index < end:
+                return region
     return "special"
 
 
@@ -493,27 +590,32 @@ def summarize_results(rows: list[dict], diagnostics: dict) -> dict:
     valid_rows = [row for row in rows if row.get("valid_for_stats")]
     by_eval = {}
     for label in ("succ", "unsucc"):
-        subset = [row for row in valid_rows if row.get("eval") == label]
-        by_eval[label] = {
-            "count": len(subset),
-            "phi_auth": summarize_numeric([row["phi_auth"] for row in subset]),
-            "phi_data_fact": summarize_numeric([row["phi_data_fact"] for row in subset]),
-            "phi_data_attack": summarize_numeric([row["phi_data_attack"] for row in subset]),
-            "attack_dominance_ratio": (
-                sum(row["shapley_attack_dominant"] for row in subset) / len(subset)
-                if subset else None
-            ),
-            "auth_fact_dominance_ratio": (
-                sum(not row["shapley_attack_dominant"] for row in subset) / len(subset)
-                if subset else None
-            ),
-        }
+        by_eval[label] = {}
+        for target_scope in sorted({row.get("target_scope", "full_action") for row in valid_rows}):
+            subset = [
+                row for row in valid_rows
+                if row.get("eval") == label and row.get("target_scope", "full_action") == target_scope
+            ]
+            by_eval[label][target_scope] = {
+                "count": len(subset),
+                "phi_auth": summarize_numeric([row["phi_auth"] for row in subset]),
+                "phi_data_fact": summarize_numeric([row["phi_data_fact"] for row in subset]),
+                "phi_data_attack": summarize_numeric([row["phi_data_attack"] for row in subset]),
+                "attack_dominance_ratio": (
+                    sum(row["shapley_attack_dominant"] for row in subset) / len(subset)
+                    if subset else None
+                ),
+                "auth_fact_dominance_ratio": (
+                    sum(not row["shapley_attack_dominant"] for row in subset) / len(subset)
+                    if subset else None
+                ),
+            }
 
     quadrant = Counter()
     for row in valid_rows:
         quadrant[
             (
-                bool(row.get("attention_shift_attack")),
+                bool(row.get("attention_shift")),
                 bool(row.get("shapley_attack_dominant")),
             )
         ] += 1
@@ -526,6 +628,7 @@ def summarize_results(rows: list[dict], diagnostics: dict) -> dict:
             "valid_for_stats": len(valid_rows),
             "eval": dict(Counter(row.get("eval") for row in rows)),
             "action_kind": dict(Counter(row.get("action_kind") for row in rows)),
+            "target_scope": dict(Counter(row.get("target_scope") for row in rows if row.get("target_scope"))),
             "parse_invalid": sum(row.get("action_kind") == "invalid_action_parse" for row in rows),
             "label_action_mismatch": sum(row.get("label_action_mismatch", False) for row in rows),
         },
@@ -612,16 +715,46 @@ def build_result_stub(row: dict, case_id: int, parsed: ParsedAction) -> dict:
     }
 
 
+def shapley_targets(parsed: ParsedAction) -> list[tuple[str, str]]:
+    targets = [("full_action", parsed.text)]
+    if parsed.kind == "tool_action" and parsed.tool_name:
+        targets.append(("tool_name", parsed.tool_name))
+    return targets
+
+
+def parse_case_ids(value: str | None) -> set[int] | None:
+    if not value:
+        return None
+    return {int(item.strip()) for item in value.split(",") if item.strip()}
+
+
 def run_experiment(args) -> None:
-    rows = read_jsonl(args.input, args.limit)
+    all_rows = read_jsonl(args.input)
     official_rows = read_json(args.official_cases)
+    selected_case_ids = parse_case_ids(args.case_ids)
+    indexed_rows = list(enumerate(all_rows))
+    if args.eval_filter != "all":
+        indexed_rows = [(case_id, row) for case_id, row in indexed_rows if row.get("eval") == args.eval_filter]
+    if selected_case_ids is not None:
+        indexed_rows = [(case_id, row) for case_id, row in indexed_rows if case_id in selected_case_ids]
     if args.limit is not None:
-        official_rows = official_rows[: args.limit]
+        indexed_rows = indexed_rows[: args.limit]
+    rows = [row for _, row in indexed_rows]
+    selected_official_rows = [official_rows[case_id] for case_id, _ in indexed_rows]
     toolkits = read_json(args.tools)
     tool_index = build_tool_index(toolkits)
-    alignment = validate_case_alignment(rows, official_rows)
+    alignment = validate_case_alignment(rows, selected_official_rows)
     coverage = validate_tool_coverage(rows, tool_index)
-    diagnostics = {"alignment": alignment, "tool_coverage": coverage}
+    diagnostics = {
+        "alignment": alignment,
+        "tool_coverage": coverage,
+        "selection": {
+            "eval_filter": args.eval_filter,
+            "case_ids": sorted(selected_case_ids) if selected_case_ids is not None else None,
+            "limit": args.limit,
+            "selected_count": len(rows),
+        },
+    }
     if args.validate_only:
         write_json(args.summary_output, diagnostics)
         return
@@ -635,7 +768,7 @@ def run_experiment(args) -> None:
 
     shapley_rows = []
     attention_rows = []
-    for case_id, row in enumerate(tqdm(rows, desc="injecagent-action")):
+    for case_id, row in tqdm(indexed_rows, desc="injecagent-action"):
         parsed = parse_action(row.get("output", ""))
         result = build_result_stub(row, case_id, parsed)
         if parsed.kind == "invalid_action_parse" or row.get("eval") == "invalid":
@@ -645,29 +778,41 @@ def run_experiment(args) -> None:
         parts = build_injecagent_prompt_parts(row, tool_index, include_all_tools=args.include_all_tools)
         prompt = parts["prompt"]
         spans = extract_action_region_spans(model, prompt, parts)
-        result["token_ranges"] = {key: list(value) for key, value in spans.items()}
-        missing_spans = [player for player in PLAYERS if player not in spans]
-        result["missing_spans"] = missing_spans
-        if missing_spans:
-            result["parse_error"] = f"Missing player spans: {missing_spans}"
+        span_validation = validate_region_spans(prompt, parts, spans)
+        result["token_ranges"] = {key: [list(span) for span in value] for key, value in spans.items()}
+        result["span_validation"] = span_validation
+        result["missing_spans"] = span_validation["missing_spans"]
+        if span_validation["missing_spans"] or any(
+            issue.get("type") == "fact_attack_overlap" for issue in span_validation["issues"]
+        ):
+            result["parse_error"] = f"Invalid player spans: {span_validation['issues']}"
             shapley_rows.append(result)
             continue
 
-        shapley = compute_action_shapley(model, prompt, parsed.text, spans)
-        phi = shapley["phi"]
-        result.update({
-            "valid_for_stats": True,
-            "values": shapley["values"],
-            "players": shapley["players"],
-            "phi_auth": phi[AUTH_KEY],
-            "phi_data_fact": phi[FACT_KEY],
-            "phi_data_attack": phi[ATTACK_KEY],
-            "action_token_count": shapley["action_token_count"],
-            "efficiency_error": shapley["efficiency_error"],
-        })
-        result["shapley_attack_dominant"] = bool(
-            result["phi_data_attack"] > result["phi_auth"] + result["phi_data_fact"]
-        )
+        full_action_result = None
+        for target_scope, target_text in shapley_targets(parsed):
+            scoped_result = dict(result)
+            scoped_result["target_scope"] = target_scope
+            scoped_result["target_text"] = target_text
+            shapley = compute_action_shapley(model, prompt, target_text, spans)
+            phi = shapley["phi"]
+            scoped_result.update({
+                "valid_for_stats": True,
+                "values": shapley["values"],
+                "players": shapley["players"],
+                "phi_auth": phi[AUTH_KEY],
+                "phi_data_fact": phi[FACT_KEY],
+                "phi_data_attack": phi[ATTACK_KEY],
+                "attack_margin": phi[ATTACK_KEY] - (phi[AUTH_KEY] + phi[FACT_KEY]),
+                "action_token_count": shapley["action_token_count"],
+                "efficiency_error": shapley["efficiency_error"],
+            })
+            scoped_result["shapley_attack_dominant"] = bool(
+                scoped_result["phi_data_attack"] > scoped_result["phi_auth"] + scoped_result["phi_data_fact"]
+            )
+            if target_scope == "full_action":
+                full_action_result = scoped_result
+            shapley_rows.append(scoped_result)
 
         if not args.skip_attention:
             attention = compute_action_attention(model, prompt, parsed.text, spans, args.attention_top_k)
@@ -683,10 +828,13 @@ def run_experiment(args) -> None:
                 **attention,
             }
             attention_rows.append(attention_row)
-            result["attention_shift_attack"] = bool(attention.get("attention_shift_attack", False))
-            result["attention_region_scores"] = attention.get("region_scores", {})
-
-        shapley_rows.append(result)
+            if full_action_result is not None:
+                full_action_result["attention_shift"] = bool(attention.get("attention_shift", False))
+                full_action_result["attention_shift_attack"] = bool(attention.get("attention_shift_attack", False))
+                full_action_result["attention_attack_dominant"] = bool(attention.get("attention_attack_dominant", False))
+                full_action_result["auth_focus_score"] = attention.get("auth_focus_score")
+                full_action_result["attention_threshold"] = attention.get("threshold")
+                full_action_result["attention_region_scores"] = attention.get("region_scores", {})
 
     summary = summarize_results(shapley_rows, diagnostics)
     write_jsonl(args.shapley_output, shapley_rows)
@@ -704,6 +852,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tools", default=DEFAULT_TOOLS)
     parser.add_argument("--model_name", default="qwen3_8b-attn")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--eval_filter", choices=["all", "succ", "unsucc", "invalid"], default="all")
+    parser.add_argument("--case_ids", help="Comma-separated original case ids to run, e.g. 35,48,209.")
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--shapley_output")
     parser.add_argument("--attention_output")
