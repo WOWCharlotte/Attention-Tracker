@@ -209,18 +209,6 @@ def render_phi_cards(row: dict) -> str:
             </div>
             """
         )
-    margin = attack_margin(row)
-    cards.append(
-        f"""
-        <div class="phi-card margin-card">
-          <div class="card-head">
-            <span class="pill region-attack">ATTACK MARGIN</span>
-            <strong>{fmt(margin)}</strong>
-          </div>
-          <small>phi_attack - (phi_auth + phi_fact)</small>
-        </div>
-        """
-    )
     return "\n".join(cards)
 
 
@@ -255,10 +243,6 @@ def render_attention(row: dict) -> str:
     if prompt_mass is None:
         prompt_mass = sum(float(v) for v in scores.values())
     prompt_mass = float(prompt_mass)
-    non_prompt_mass = attention.get("non_prompt_attention_mass")
-    if non_prompt_mass is None:
-        non_prompt_mass = max(0.0, 1.0 - prompt_mass)
-    non_prompt_mass = float(non_prompt_mass)
     normalized = attention.get("region_scores_normalized") or {
         region: float(value) / (prompt_mass or 1.0)
         for region, value in scores.items()
@@ -335,13 +319,9 @@ def render_attention(row: dict) -> str:
         <span class="chip">Shift: {bool_label(row.get("attention_shift", row.get("attention_shift_attack")))}</span>
       </div>
       <div class="attention-score-grid">
-        <div class="attention-score"><span>Prompt Mass</span><strong>{fmt(prompt_mass)}</strong></div>
-        <div class="attention-score"><span>Non-Prompt Mass</span><strong>{fmt(non_prompt_mass)}</strong></div>
-        <div class="attention-score"><span>Player Mass</span><strong>{fmt(player_mass)}</strong></div>
         <div class="attention-score"><span>Auth Focus</span><strong>{fmt(attention.get("auth_focus_score", player_normalized.get("auth")))}</strong></div>
         <div class="attention-score"><span>Threshold</span><strong>{fmt(attention.get("threshold"))}</strong></div>
         <div class="attention-score"><span>Attack Dominant</span><strong>{bool_label(attention.get("attention_attack_dominant"))}</strong></div>
-        <div class="attention-score"><span>Prompt-Normalized Sum</span><strong>{fmt(sum(float(normalized.get(region, 0.0)) for region in ("auth", "data_fact", "data_attack", "special")))}</strong></div>
       </div>
       <h3 class="mini-heading">Player-Normalized Attention</h3>
       {''.join(player_rows)}
@@ -370,10 +350,6 @@ def render_status(row: dict) -> str:
       <div class="status-card">
         <span>Shapley Attack Dominant</span>
         <strong class="{status_class(row.get("shapley_attack_dominant"))}">{bool_label(row.get("shapley_attack_dominant"))}</strong>
-      </div>
-      <div class="status-card">
-        <span>Label/Action Mismatch</span>
-        <strong class="{status_class(row.get("label_action_mismatch"))}">{bool_label(row.get("label_action_mismatch"))}</strong>
       </div>
     </div>
     """
